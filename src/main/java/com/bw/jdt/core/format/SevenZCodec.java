@@ -96,6 +96,22 @@ public final class SevenZCodec implements ContainerCodec {
     }
 
     @Override
+    public List<LogicalEntry> list(byte[] metaBytes) throws IOException {
+        DataInputStream meta = new DataInputStream(new java.io.ByteArrayInputStream(metaBytes));
+        meta.readUTF(); // content method, irrelevant for a listing
+        int count = meta.readInt();
+        List<LogicalEntry> entries = new ArrayList<>(count);
+        int partIndex = 0;
+        for (int i = 0; i < count; i++) {
+            EntryMeta m = EntryMeta.read(meta);
+            if (m.hasStream) {
+                entries.add(new LogicalEntry(m.name, m.size, partIndex++));
+            }
+        }
+        return entries;
+    }
+
+    @Override
     public void rebuild(byte[] metaBytes, List<ByteSource> parts, OutputStream out, int threads)
             throws IOException {
         DataInputStream meta = new DataInputStream(new java.io.ByteArrayInputStream(metaBytes));

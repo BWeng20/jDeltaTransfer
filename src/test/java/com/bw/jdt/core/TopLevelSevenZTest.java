@@ -81,6 +81,23 @@ class TopLevelSevenZTest {
                 System.out.printf(Locale.ROOT, "%-18d %10s %10.2f%n",
                         threads, Fmt.seconds(ns), serialNs / (double) ns);
             }
+
+            // The alternative to re-encoding at all: same content, cheaper shape.
+            for (Repacker.Mode mode : Repacker.Mode.values()) {
+                Path target = mode == Repacker.Mode.ZIP
+                        ? tmp.resolve("repacked.zip")
+                        : tmp.resolve("tree");
+                long t = System.nanoTime();
+                try (WorkDir wd = WorkDir.createTemp(tmp.resolve("work"), "pack-")) {
+                    Repacker packer = new Repacker(store, wd).withThreads(8);
+                    Repacker.Result r = packer.write(bp, mode, target);
+                    packer.verifyEntries(bp, mode, target);
+                    long ns = System.nanoTime() - t;
+                    System.out.printf(Locale.ROOT, "%-18s %10s %10.2f  (%d members, output %s)%n",
+                            "repack " + mode, Fmt.seconds(ns), serialNs / (double) ns,
+                            r.entries(), Fmt.human(r.outputBytes()));
+                }
+            }
         }
     }
 

@@ -14,6 +14,7 @@ import com.bw.jdt.core.Fmt;
 import com.bw.jdt.core.Hash;
 import com.bw.jdt.core.Hashes;
 import com.bw.jdt.core.Reassembler;
+import com.bw.jdt.core.Repacker;
 import com.bw.jdt.core.WorkDir;
 import com.bw.jdt.proto.Wire;
 
@@ -44,6 +45,7 @@ public final class DeltaClient implements Closeable {
     private boolean keepBaseCache;
     private int indexThreads = Math.min(8, Runtime.getRuntime().availableProcessors());
     private int rebuildThreads = Math.min(8, Runtime.getRuntime().availableProcessors());
+    private RebuildAs rebuildAs = RebuildAs.ORIGINAL;
 
     public interface Log {
         void info(String message);
@@ -59,6 +61,28 @@ public final class DeltaClient implements Closeable {
                 .connectTimeout(Duration.ofSeconds(20))
                 .followRedirects(HttpClient.Redirect.NORMAL)
                 .build();
+    }
+
+    /**
+     * What the client should end up with.
+     *
+     * <p>{@link #ORIGINAL} is the only mode whose result carries the archive's published
+     * SHA-256, because it is the only one that produces that file. The other two write the same
+     * content in a cheaper shape, which is worth it when the consumer does not need the original
+     * container -- a solid 7z costs minutes per gigabyte to re-encode and cannot be parallelised.
+     */
+    public enum RebuildAs {
+        /** Reproduce the archive byte for byte. */
+        ORIGINAL,
+        /** Write the content into a ZIP with stored entries. */
+        ZIP,
+        /** Write the content into a directory tree. */
+        EXTRACT
+    }
+
+    public DeltaClient rebuildAs(RebuildAs mode) {
+        this.rebuildAs = mode;
+        return this;
     }
 
     /** Nested archives rebuilt in parallel. This is the dominant cost of a warm transfer. */
@@ -237,28 +261,23 @@ public final class DeltaClient implements Closeable {
 
             ChunkSource source = ChunkSource.composite(List.of(local, incoming));
             long tRebuild = System.nanoTime();
-            Path tmp = tempNextTo(out);
-            try (WorkDir wd = WorkDir.createTemp(incomingDir.resolve("tmp"), "rebuild-");
-                 OutputStream os = new BufferedOutputStream(Files.newOutputStream(tmp), 1 << 20)) {
-                Hash actual = new Reassembler(source, wd)
-                        .withThreads(rebuildThreads)
-                        .writeTo(bp, os);
-                os.flush();
-                if (!actual.equals(expected)) {
-                    throw new IOException("rebuilt archive hash mismatch: expected " + expected
-                            + ", got " + actual);
-                }
-            } catch (IOException e) {
-                Files.deleteIfExists(tmp);
-                throw e;
+            if (rebuildAs == RebuildAs.ORIGINAL) {
+                rebuildOriginal(bp, source, incomingDir, out, expected);
+            } else {
+                repack(bp, source, incomingDir, out);
             }
-            Files.move(tmp, out, StandardCopyOption.REPLACE_EXISTING);
             long rebuildNanos = System.nanoTime() - tRebuild;
 
             // Fold the downloaded blocks into the base index so the two together describe the
             // version just built. The directory is relabelled below, once both stores are shut.
-            local.importFrom(incoming);
-            handOver = true;
+            //
+            // Only meaningful when the original archive was produced: the cache is keyed by the
+            // base file's hash, and a repacked container is a different file. Leaving the base
+            // cache under its own key keeps it usable for another run from the same base.
+            if (rebuildAs == RebuildAs.ORIGINAL) {
+                local.importFrom(incoming);
+                handOver = true;
+            }
 
             Phases phases = new Phases(indexNanos, downloadNanos, rebuildNanos);
             log.info("phases: " + phases.describe());
@@ -272,6 +291,53 @@ public final class DeltaClient implements Closeable {
             handOverCache(localStoreDir, expected, bp.chunkParams(), bp.limits());
         }
         return result;
+    }
+
+    /** The default: reproduce the archive byte for byte and check its SHA-256. */
+    private void rebuildOriginal(Blueprint bp, ChunkSource source, Path incomingDir, Path out,
+                                 Hash expected) throws IOException {
+        Path tmp = tempNextTo(out);
+        try (WorkDir wd = WorkDir.createTemp(incomingDir.resolve("tmp"), "rebuild-");
+             OutputStream os = new BufferedOutputStream(Files.newOutputStream(tmp), 1 << 20)) {
+            Hash actual = new Reassembler(source, wd)
+                    .withThreads(rebuildThreads)
+                    .writeTo(bp, os);
+            os.flush();
+            if (!actual.equals(expected)) {
+                throw new IOException("rebuilt archive hash mismatch: expected " + expected
+                        + ", got " + actual);
+            }
+        } catch (IOException e) {
+            Files.deleteIfExists(tmp);
+            throw e;
+        }
+        Files.move(tmp, out, StandardCopyOption.REPLACE_EXISTING);
+    }
+
+    /**
+     * Writes the content instead of the original container. Falls back to a bit exact rebuild if
+     * the outermost container cannot be described in logical terms, because a correct archive in
+     * the wrong shape beats no archive.
+     */
+    private void repack(Blueprint bp, ChunkSource source, Path incomingDir, Path out)
+            throws IOException {
+        if (!Repacker.isSupported(bp)) {
+            log.info("this version's outer container cannot be repacked; "
+                    + "rebuilding it in its original format instead");
+            rebuildOriginal(bp, source, incomingDir, out, bp.archiveHash());
+            return;
+        }
+        Repacker.Mode mode = rebuildAs == RebuildAs.ZIP ? Repacker.Mode.ZIP : Repacker.Mode.EXTRACT;
+        try (WorkDir wd = WorkDir.createTemp(incomingDir.resolve("tmp"), "repack-")) {
+            Repacker repacker = new Repacker(source, wd).withThreads(rebuildThreads);
+            Repacker.Result r = repacker.write(bp, mode, out);
+            repacker.verifyEntries(bp, mode, out);
+            log.info("repacked as " + mode + ": " + r.entries() + " members, "
+                    + Fmt.human(r.contentBytes()) + " of content, output "
+                    + Fmt.human(r.outputBytes()) + "; every member verified against the blueprint");
+            log.info("note: this is NOT the original archive, so it does not carry its SHA-256 ("
+                    + bp.archiveHash().hex().substring(0, 16) + "...)");
+        }
     }
 
     private static void deleteRecursively(Path dir) {

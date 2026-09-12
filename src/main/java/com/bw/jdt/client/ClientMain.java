@@ -51,7 +51,8 @@ public final class ClientMain {
                 .indexThreads(args.getInt("index-threads",
                         Math.min(8, Runtime.getRuntime().availableProcessors())))
                 .rebuildThreads(args.getInt("rebuild-threads",
-                        Math.min(8, Runtime.getRuntime().availableProcessors())))) {
+                        Math.min(8, Runtime.getRuntime().availableProcessors())))
+                .rebuildAs(parseRebuildAs(args.get("rebuild-as", "original")))) {
             switch (command) {
                 case "list" -> printList(client.listVersions());
                 case "info" -> System.out.println(client.versionInfo(args.require("version")).toPrettyString());
@@ -109,6 +110,14 @@ public final class ClientMain {
         System.out.println("  written to         " + out);
     }
 
+    private static DeltaClient.RebuildAs parseRebuildAs(String value) {
+        try {
+            return DeltaClient.RebuildAs.valueOf(value.trim().toUpperCase(Locale.ROOT));
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("--rebuild-as must be one of original, zip, extract");
+        }
+    }
+
     private static void printList(JsonNode root) {
         System.out.printf(Locale.ROOT, "%-16s %14s  %-64s %s%n", "VERSION", "SIZE", "SHA-256", "BLOCKS");
         for (JsonNode v : root.path("versions")) {
@@ -140,6 +149,13 @@ public final class ClientMain {
                                        (default: min(cores, 8))
                   --rebuild-threads N  nested archives rebuilt in parallel; this is the dominant
                                        cost of a warm transfer (default: min(cores, 8))
+                  --rebuild-as M       original (default), zip or extract. Only "original"
+                                       reproduces the archive byte for byte and can be checked
+                                       against the published SHA-256. The other two write the same
+                                       content in a cheaper shape, which is worth it for a solid
+                                       7z: re-encoding one costs minutes per gigabyte and cannot
+                                       be parallelised. Each member is still verified against the
+                                       blueprint.
                 """);
     }
 }

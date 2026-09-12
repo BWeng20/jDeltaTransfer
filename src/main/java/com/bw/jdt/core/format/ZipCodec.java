@@ -134,6 +134,62 @@ public final class ZipCodec implements ContainerCodec {
         }
     }
 
+    /**
+     * Recovers the entry names from the local file headers, which the skeleton keeps verbatim.
+     *
+     * <p>Decomposition emits a raw region followed by that entry's payload, so the tail of each
+     * inline segment is the local file header of the payload that follows it. A payload with no
+     * such header in front of it is not an entry but a raw region of the file -- the central
+     * directory, typically -- and is left out of the listing.
+     *
+     * <p>Sizes come from the parts themselves rather than from the header, because a header may
+     * carry zeroes when the entry used a data descriptor.
+     */
+    @Override
+    public List<LogicalEntry> list(byte[] metaBytes) throws IOException {
+        List<Segment> segments = readSegments(metaBytes);
+        List<LogicalEntry> entries = new ArrayList<>();
+        String pendingName = null;
+        int partIndex = 0;
+        for (Segment s : segments) {
+            if (s.inline != null) {
+                pendingName = trailingLocalHeaderName(s.inline);
+                continue;
+            }
+            int index = partIndex++;
+            if (pendingName != null) {
+                // Size is filled in by the caller, which knows the part; -1 means "ask the part".
+                entries.add(new LogicalEntry(pendingName, -1, index));
+                pendingName = null;
+            }
+        }
+        return entries;
+    }
+
+    /** @return the entry name if {@code raw} ends with a complete local file header, else null */
+    private static String trailingLocalHeaderName(byte[] raw) {
+        for (int i = raw.length - 30; i >= 0; i--) {
+            if ((raw[i] & 0xFF) != 0x50 || (raw[i + 1] & 0xFF) != 0x4B
+                    || (raw[i + 2] & 0xFF) != 0x03 || (raw[i + 3] & 0xFF) != 0x04) {
+                continue;
+            }
+            ByteBuffer lfh = ByteBuffer.wrap(raw, i, raw.length - i).order(ByteOrder.LITTLE_ENDIAN);
+            int nameLen = lfh.getShort(i + 26) & 0xFFFF;
+            int extraLen = lfh.getShort(i + 28) & 0xFFFF;
+            if (i + 30 + nameLen + extraLen != raw.length || nameLen == 0) {
+                continue;
+            }
+            int flags = lfh.getShort(i + 6) & 0xFFFF;
+            // Bit 11 marks the name as UTF-8; otherwise ZIP says CP437, and for the ASCII names
+            // this project deals with the two agree anyway.
+            java.nio.charset.Charset cs = (flags & 0x800) != 0
+                    ? java.nio.charset.StandardCharsets.UTF_8
+                    : java.nio.charset.StandardCharsets.ISO_8859_1;
+            return new String(raw, i + 30, nameLen, cs);
+        }
+        return null;
+    }
+
     @Override
     public void rebuild(byte[] metaBytes, List<ByteSource> parts, OutputStream out, int threads)
             throws IOException {

@@ -230,6 +230,7 @@ jdt client hash --file FILE          SHA-256 of a local file
 --keep-base-cache  copy the index to the new version instead of renaming it
 --index-threads N  entries decomposed in parallel while indexing the base (default: min(cores, 8))
 --rebuild-threads N  nested archives and deflated entries rebuilt in parallel (default: min(cores, 8))
+--rebuild-as M       original (default), zip or extract; see "Giving up byte identity"
                One sub directory per base version, named by its hash. Nothing prunes it, so
                delete the sub directories of versions you no longer upgrade from.
 --version ID   version to fetch
@@ -430,29 +431,59 @@ the other in the index; rename one to serve both.
 The delta itself holds up — the outer solid stream is taken apart rather than treated as one
 blob — but the rebuild does not.
 
-Measured on a 126 MiB top level 7z with nine nested archives:
+Measured on a 126 MiB top level 7z with nine nested archives inside:
 
-| rebuild-threads | 1 | 8 | 16 |
-|-----------------|---|---|----|
-| rebuild | 38.7 s | 38.7 s | 38.7 s |
-| speedup | — | 1.00 | 1.00 |
+| what | time | vs serial | output |
+|------|------|-----------|--------|
+| bit exact rebuild, 1 thread | 40.6 s | — | 126.65 MiB |
+| bit exact rebuild, 8 threads | 39.6 s | 1.03 | 126.65 MiB |
+| bit exact rebuild, 16 threads | 36.9 s | 1.10 | 126.65 MiB |
+| `--rebuild-as zip` | **3.0 s** | **13.3** | 151.88 MiB |
+| `--rebuild-as extract` | 3.8 s | 10.6 | 151.86 MiB |
 
-**Threads buy nothing here**, and no amount of engineering will change that. 7z packs its entries
-into a single solid LZMA2 stream, so unlike ZIP entries they are not independently compressed and
-cannot be re-encoded independently either. The nested archives inside still rebuild concurrently,
-but they are a rounding error next to one sequential LZMA2 pass over the whole container.
+**Threads buy almost nothing on the bit exact path**, and no amount of engineering will change
+that. 7z packs its entries into a single solid LZMA2 stream, so unlike ZIP entries they are not
+independently compressed and cannot be re-encoded independently either. The nested archives inside
+still rebuild concurrently, but they are a rounding error next to one sequential LZMA2 pass over
+the whole container. 40.6 s for 126 MiB extrapolates to roughly five minutes per gigabyte, on
+every transfer, on the client.
 
-Two consequences worth weighing before putting 7z on top:
+`--max-7z-size` also applies to the outermost container. Above it the entire archive becomes one
+opaque blob and the delta collapses to a full transfer — still correct, but pointless. A multi
+gigabyte top level 7z therefore needs that limit raised, which costs exactly the LZMA2 time above.
 
-- Rebuild time scales with the container and stays serial. 38.7 s for 126 MiB extrapolates to
-  roughly five minutes for a gigabyte, on every transfer, on the client.
-- `--max-7z-size` applies to the outermost container as well. Above it the entire archive becomes
-  one opaque blob and the delta collapses to a full transfer — still correct, but pointless. A
-  multi gigabyte top level 7z therefore needs that limit raised, which costs exactly the LZMA2
-  time described above.
+### Giving up byte identity on purpose
 
-ZIP on top with 7z nested inside gets the best of both: the outer entries parallelise, and the
-nested 7z containers are small enough for their solid streams not to dominate.
+The last two rows are the way out, and they are a different promise. `--rebuild-as` decides what
+the client ends up with:
+
+| mode | result | verified against |
+|------|--------|------------------|
+| `original` (default) | the archive, byte for byte | its published SHA-256 |
+| `zip` | a ZIP with stored entries | every member's content, per member |
+| `extract` | the members as files in a directory | every member's content, per member |
+
+The repacked output is deliberately **not** the original file and does not carry its SHA-256 —
+there would be no point pretending otherwise. What still holds is that every byte came from a
+block whose hash was checked on arrival, and that each member was written with exactly the content
+the blueprint describes; `Repacker.verifyEntries` re-reads the output and compares member by
+member. `RepackTest` pins that down by reading the bit exact rebuild and the repack side by side
+and asserting the two agree on every member.
+
+Three things to know before using it:
+
+- **It costs disk.** Stored entries mean no compression: 151.88 MiB against the original 126.65
+  MiB here, and the gap widens the better the original compressed. Re-deflating instead would give
+  back some of that and hand back most of the 13x, which is why `zip` stores rather than deflates.
+- **A repack cannot be the base of the next delta**, so the client keeps the cache under the base's
+  own key instead of handing it over. The next upgrade from the same base still reuses its index.
+- **Nested archives stay whole.** Each is rebuilt bit exactly and written as one member; only the
+  outermost container changes shape. Nothing is unpacked recursively.
+- CAB cannot be listed logically yet, so `--rebuild-as` on a top level cabinet falls back to the
+  original format with a log line. The output is correct, just not the requested shape.
+
+ZIP on top with 7z nested inside needs none of this: the outer entries parallelise, and the nested
+7z containers are small enough for their solid streams not to dominate.
 
 One thing the handover cannot do: seed a cache from a `/full` download. Those blocks are cut over
 the *compressed* archive stream and live in a different block space than the blueprint's

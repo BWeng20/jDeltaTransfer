@@ -37,6 +37,32 @@ public interface ContainerCodec {
     void rebuild(byte[] meta, List<ByteSource> parts, OutputStream out, int threads) throws IOException;
 
     /**
+     * Names the container's members, so a caller can write the same content into a different
+     * format instead of reproducing the original bytes.
+     *
+     * <p>Optional on purpose. The blueprint stores codec private metadata, not a portable file
+     * list, and for some formats the listing can only be recovered from verbatim header bytes.
+     * A codec that cannot describe its members returns {@code null}, and the caller falls back
+     * to a bit exact rebuild -- which is always available.
+     *
+     * @return one entry per payload bearing member, or {@code null} if unavailable
+     */
+    default List<LogicalEntry> list(byte[] meta) throws IOException {
+        return null;
+    }
+
+    /**
+     * One member of a container, in logical terms.
+     *
+     * @param name       path inside the container, using {@code /} as separator
+     * @param size       uncompressed size, or -1 when the codec cannot state it cheaply and the
+     *                   caller should take it from the part
+     * @param partIndex  index into the {@code parts} list that carries this member's content
+     */
+    record LogicalEntry(String name, long size, int partIndex) {
+    }
+
+    /**
      * @param meta  codec private description of headers, ordering and compression settings
      * @param parts decompressed payload of every entry, in the order the codec expects them back
      */
