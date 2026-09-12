@@ -32,7 +32,7 @@ class SevenZCodecProbeTest {
         assertNotNull(nested, "the generator must place at least one nested 7z in every version");
 
         try (WorkDir wd = WorkDir.createTemp(tmp.resolve("work"), "p-")) {
-            ContainerCodec.Decomposition d = new SevenZCodec().decompose(ByteSource.ofFile(nested), wd);
+            ContainerCodec.Decomposition d = new SevenZCodec().decompose(ByteSource.ofFile(nested), wd, DecomposeLimits.DEFAULT);
             assertNotNull(d, "the nested 7z should be decomposable, not opaque");
             assertTrue(d.parts().size() >= 1);
 

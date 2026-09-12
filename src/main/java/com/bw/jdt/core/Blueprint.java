@@ -13,7 +13,8 @@ import java.util.Set;
  * <p>Transferring a new version means transferring this blueprint plus only those blocks the
  * receiver does not already have from its older version.
  */
-public record Blueprint(Hash archiveHash, long archiveSize, Chunker.Params chunkParams, Node root) {
+public record Blueprint(Hash archiveHash, long archiveSize, Chunker.Params chunkParams,
+                       DecomposeLimits limits, Node root) {
 
     /** Distinct block hashes referenced anywhere in the tree, with their lengths. */
     public Map<Hash, Integer> distinctChunks() {

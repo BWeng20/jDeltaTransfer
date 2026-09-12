@@ -7,6 +7,7 @@ import org.apache.commons.compress.archivers.sevenz.SevenZMethodConfiguration;
 import org.apache.commons.compress.archivers.sevenz.SevenZOutputFile;
 import com.bw.jdt.core.ByteSource;
 import com.bw.jdt.core.ContainerFormat;
+import com.bw.jdt.core.DecomposeLimits;
 import com.bw.jdt.core.Hashes;
 import com.bw.jdt.core.WorkDir;
 
@@ -40,8 +41,8 @@ public final class SevenZCodec implements ContainerCodec {
             SevenZMethod.LZMA2, SevenZMethod.DEFLATE, SevenZMethod.COPY, SevenZMethod.BZIP2, SevenZMethod.LZMA
     };
 
-    /** Above this size the round trip verification costs more than the delta is worth. */
-    private static final long MAX_DECOMPOSE_SIZE = 512L * 1024 * 1024;
+
+
 
     @Override
     public ContainerFormat format() {
@@ -49,8 +50,8 @@ public final class SevenZCodec implements ContainerCodec {
     }
 
     @Override
-    public Decomposition decompose(ByteSource src, WorkDir wd) throws IOException {
-        if (src.size() > MAX_DECOMPOSE_SIZE) {
+    public Decomposition decompose(ByteSource src, WorkDir wd, DecomposeLimits limits) throws IOException {
+        if (src.size() > limits.maxSevenZBytes()) {
             return null;
         }
         Path local = materialise(src, wd);

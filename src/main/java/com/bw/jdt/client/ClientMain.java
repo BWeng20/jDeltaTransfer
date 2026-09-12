@@ -46,7 +46,10 @@ public final class ClientMain {
         Path cache = Paths.get(args.get("cache", "jdt-client-cache")).toAbsolutePath().normalize();
         DeltaClient.Log log = DeltaClient.Log.STDOUT;
 
-        try (DeltaClient client = new DeltaClient(server, cache, log)) {
+        try (DeltaClient client = new DeltaClient(server, cache, log)
+                .keepBaseCache(args.has("keep-base-cache"))
+                .indexThreads(args.getInt("index-threads",
+                        Math.min(8, Runtime.getRuntime().availableProcessors())))) {
             switch (command) {
                 case "list" -> printList(client.listVersions());
                 case "info" -> System.out.println(client.versionInfo(args.require("version")).toPrettyString());
@@ -98,6 +101,9 @@ public final class ClientMain {
         System.out.println("  transferred        " + Fmt.human(r.transferredBytes())
                 + "  (" + Fmt.percent(r.savedFraction()) + " less than the full archive)");
         System.out.println("  elapsed            " + Fmt.seconds(elapsed));
+        if (r.delta()) {
+            System.out.println("  phases             " + r.phases().describe());
+        }
         System.out.println("  written to         " + out);
     }
 
@@ -126,6 +132,10 @@ public final class ClientMain {
                 Common options:
                   --server URL   server base URL (default: http://localhost:8080)
                   --cache DIR    where the decomposed local base is cached (default: ./jdt-client-cache)
+                  --keep-base-cache  copy the index to the new version instead of renaming it,
+                                     keeping the old base indexed as well
+                  --index-threads N  entries decomposed in parallel while indexing the base
+                                     (default: min(cores, 8))
                 """);
     }
 }

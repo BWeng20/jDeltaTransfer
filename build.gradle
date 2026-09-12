@@ -29,6 +29,8 @@ test {
     useJUnitPlatform()
     testLogging { events 'passed', 'failed', 'skipped'; showStandardStreams = true }
     maxHeapSize = '2g'
+    // Opt-in benchmarks stay off unless asked for: gradlew test -Pbench
+    systemProperty 'jdt.bench', project.hasProperty('bench') ? 'true' : 'false'
 }
 
 jar {

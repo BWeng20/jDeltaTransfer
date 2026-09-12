@@ -12,7 +12,8 @@
     "blockSizeAvg",
     "blockSizeMax",
     "storedBlocks",
-    "storedBlockBytes"
+    "storedBlockBytes",
+    "maxSevenZDecomposeSize"
   ],
   "properties": {
     "hashAlgorithm": {
@@ -50,6 +51,12 @@
       "type": "integer",
       "description": "Total payload bytes in the block store. Smaller than the sum of all archive sizes because versions share blocks.",
       "minimum": 0
+    },
+    "maxSevenZDecomposeSize": {
+      "type": "integer",
+      "description": "The server's --max-7z-size: the largest nested 7z container that is opened up instead of being carried as opaque blocks. Informational here; the authoritative value for any given version travels inside its blueprint, because the client has to decompose its local base under the same policy that produced the target's blueprint.",
+      "minimum": 0,
+      "examples": [536870912]
     }
   }
 }

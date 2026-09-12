@@ -19,7 +19,10 @@ import java.util.zip.GZIPOutputStream;
 public final class BlueprintCodec {
 
     private static final byte[] MAGIC = {'J', 'D', 'T', 'B', 'P'};
-    private static final int FORMAT_VERSION = 1;
+
+    /** Version 2 added the decomposition limits; version 1 blueprints are still readable. */
+    private static final int FORMAT_VERSION = 2;
+    private static final int MIN_READABLE_VERSION = 1;
 
     private static final byte NODE_BLOB = 0;
     private static final byte NODE_CONTAINER = 1;
@@ -50,6 +53,7 @@ public final class BlueprintCodec {
         out.writeInt(bp.chunkParams().min());
         out.writeInt(bp.chunkParams().avg());
         out.writeInt(bp.chunkParams().max());
+        out.writeLong(bp.limits().maxSevenZBytes());
         writeNode(out, bp.root());
         out.flush();
     }
@@ -61,14 +65,18 @@ public final class BlueprintCodec {
             throw new IOException("not a jDeltaTransfer blueprint");
         }
         int version = in.readUnsignedByte();
-        if (version != FORMAT_VERSION) {
+        if (version < MIN_READABLE_VERSION || version > FORMAT_VERSION) {
             throw new IOException("unsupported blueprint version " + version);
         }
         Hash hash = Hash.wrap(in.readNBytes(Hash.LENGTH));
         long size = in.readLong();
         Chunker.Params params = new Chunker.Params(in.readInt(), in.readInt(), in.readInt());
+        // Blueprints written before the limits were configurable were produced with the default.
+        DecomposeLimits limits = version >= 2
+                ? new DecomposeLimits(in.readLong())
+                : DecomposeLimits.DEFAULT;
         Node root = readNode(in);
-        return new Blueprint(hash, size, params, root);
+        return new Blueprint(hash, size, params, limits, root);
     }
 
     private static void writeNode(DataOutputStream out, Node node) throws IOException {

@@ -212,6 +212,8 @@ jdt client hash --file FILE          SHA-256 of a local file
 --max-block-size SZ   hard upper bound for any block            (default: 4MiB)
 --avg-block-size SZ   target average block size                 (default: 64KiB)
 --threads N           HTTP worker threads                       (default: cores)
+--ingest-threads N    archives decomposed in parallel on scan   (default: cores/2, max 4)
+--max-7z-size SZ      largest nested 7z opened up                (default: 512MiB)
 --verify true|false   rebuild and compare after each ingest     (default: true)
 --force-reindex       discard blocks and blueprints, ingest again
 --no-scan             do not ingest on startup
@@ -222,6 +224,8 @@ jdt client hash --file FILE          SHA-256 of a local file
 ```
 --server URL   server base URL                     (default: http://localhost:8080)
 --cache DIR    where the decomposed base is cached (default: ./jdt-client-cache)
+--keep-base-cache  copy the index to the new version instead of renaming it
+--index-threads N  entries decomposed in parallel while indexing the base (default: min(cores, 8))
                One sub directory per base version, named by its hash. Nothing prunes it, so
                delete the sub directories of versions you no longer upgrade from.
 --version ID   version to fetch
@@ -298,8 +302,10 @@ independently and compared against the SHA-256 the server publishes; every step 
 Two things are worth reading out of the table. First, a large part of each delta is not overhead
 but genuine new content: version *n+1* is 15% larger than version *n* by construction, so for
 v10 roughly 471 MiB of the 723 MiB transferred is data that simply did not exist before. Second,
-the `seconds` column is dominated by decomposing the local base, not by the transfer — see
-"Possible next step" below.
+the `seconds` column is dominated by decomposing the local base, not by the transfer. These
+timings predate the cache handover described under
+[Client cost, and where it goes](#client-cost-and-where-it-goes); with it, every step after the
+first no longer pays for indexing at all.
 
 
 
@@ -307,19 +313,82 @@ the `seconds` column is dominated by decomposing the local base, not by the tran
 
 - Multi part cabinets (`PREV_CABINET` / `NEXT_CABINET`) and Quantum/LZX compressed folders are not
   taken apart; such a cabinet is transferred as opaque blocks.
-- 7z containers above 512 MiB are left opaque, because the round trip verification would cost
-  more than the delta saves.
+- 7z containers above `--max-7z-size` (default 512 MiB) are left opaque — see
+  [Raising the 7z limit](#raising-the-7z-limit).
 - ZIP archives with prepended data (self extracting stubs) whose central directory offset does not
   match the real position fall back to opaque blocks.
 - All of the above are correctness preserving fallbacks; they only reduce how small a delta gets.
 
-### Possible next step
+### Raising the 7z limit
 
-Before each delta the client decomposes its local base to learn which blocks it can derive from
-it, and caches that index under `--cache` keyed by the base's hash. Walking a chain of versions
-therefore re-indexes at every step. The client could instead seed the cache for version *n+1*
-directly from the blocks it just used to rebuild version *n*. That trades roughly two gigabytes
-of disk writes for a couple of minutes of CPU per step, so it is worth doing on slow machines and
-not worth doing on fast ones — which is why it is not the default. Note that this only works after
-a delta fetch: the blocks of a `/full` download are cut over the *compressed* archive stream and
-live in a different block space than the blueprint's decompressed blocks.
+`--max-7z-size` decides how large a nested 7z may be before it is carried as opaque blocks
+instead of being opened up. The default is 512 MiB. Raising it makes deltas smaller; the price is
+LZMA2 time, and it is worth knowing exactly where that time lands.
+
+Measured on an AMD Ryzen 7 5700X 3.40 GHz with `gradlew test --tests '*SevenZCostBenchmark*' -Pbench`
+(Commons Compress LZMA2, single threaded, throughput in uncompressed MB/s):
+
+| raw content | 7z size | decompose | rebuild | rebuild MB/s |
+|-------------|---------|-----------|---------|--------------|
+| 16 MiB      | 10.77 MiB | 4.7 s   | 4.5 s   | 3.5 |
+| 48 MiB      | 32.24 MiB | 16.9 s  | 18.6 s  | 2.6 |
+| 96 MiB      | 64.42 MiB | 41.6 s  | 39.7 s  | 2.4 |
+
+**`decompose` is a one-off per version on the server. `rebuild` is not** — the client pays it on
+every single delta transfer, because putting the archive back together means re-encoding that 7z
+with LZMA2. The server pays it too, on `--verify` ingest and when serving `/full` without the
+original file.
+
+At roughly 2.4 MB/s that means a 512 MiB 7z (about 768 MiB of content) already costs some five
+minutes per rebuild. At 2 GiB it would be around twenty minutes — far more than transferring the
+thing whole over most links.
+
+A rule of thumb: decomposing a 7z saves about `raw / 1.5` bytes of transfer and costs about
+`raw / 2.4 MB/s` seconds of CPU. The two break even at a link speed of roughly **13 Mbit/s**.
+Below that, open the container up. Above it, you are trading wall clock for bandwidth — which is
+still the right call on metered or expensive links, where volume matters more than time.
+
+Two caveats:
+
+- **The limit must match on both sides.** The client decomposes its local base to learn what it
+  can derive; under a different policy it would cut different blocks out of identical content and
+  the delta would collapse. That is why the limit travels inside the blueprint rather than being
+  configured separately per side — the client always uses the policy that produced the blueprint
+  it is fetching. Correctness is never at risk either way; only the saving is.
+- Changing it does not re-decompose existing versions. Use `--force-reindex` for that, or the old
+  versions keep their old policy (which is recorded in their blueprints and honoured correctly).
+
+### Client cost, and where it goes
+
+The intended deployment is one short lived client process per upgrade, restarted later for the
+next version. Measured on the 1 GiB chain, per run:
+
+| run | index | download | rebuild | total |
+|-----|-------|----------|---------|-------|
+| first ever (cold cache) | 24.9 s | 1.1 s | 28.5 s | 56.4 s |
+| every later one | **0.0 s** | 1.8 s | 35.7 s | 39.9 s |
+
+Indexing disappears after the first run because of **cache handover**: once a transfer succeeds,
+the base's block index plus the freshly downloaded blocks already describe the version just
+built, so the cache directory is relabelled to that version's key. The next process finds it and
+skips decomposing altogether. Renaming costs milliseconds against 25 to 30 seconds of
+decomposition.
+
+The base's own index is consumed by the handover. That is the right trade when upgrading forward
+one version at a time; `--keep-base-cache` copies instead, keeping both indexed, at the price of
+a full copy of the cache.
+
+`--index-threads` (default `min(cores, 8)`) decomposes the outermost archive's entries in
+parallel. It is worth less than it looks: 30.1 s single threaded against 23.7 s on sixteen, a
+speedup of only 1.27. Roughly three quarters of indexing is serial, because the deflate level
+probe runs inside the ZIP codec before the parallel section begins. Parallelising *that* is the
+real fix, but with handover in place indexing only ever runs once per machine, so it stopped
+being worth the complexity.
+
+**Rebuild is now the dominant cost** — around 89% of a warm run — and unlike indexing it happens
+every single time. The nested archives are independent subtrees, so rebuilding them concurrently
+is the next worthwhile step; it would also attack the LZMA2 cost described above.
+
+One thing the handover cannot do: seed a cache from a `/full` download. Those blocks are cut over
+the *compressed* archive stream and live in a different block space than the blueprint's
+decompressed blocks, so the first delta after a full download always has to index its base.

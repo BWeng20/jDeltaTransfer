@@ -2,6 +2,7 @@ package com.bw.jdt.core.format;
 
 import com.bw.jdt.core.ByteSource;
 import com.bw.jdt.core.ContainerFormat;
+import com.bw.jdt.core.DecomposeLimits;
 import com.bw.jdt.core.WorkDir;
 
 import java.io.ByteArrayOutputStream;
@@ -54,7 +55,7 @@ public final class ZipCodec implements ContainerCodec {
     }
 
     @Override
-    public Decomposition decompose(ByteSource src, WorkDir wd) throws IOException {
+    public Decomposition decompose(ByteSource src, WorkDir wd, DecomposeLimits limits) throws IOException {
         try (RandomAccessSource ras = RandomAccessSource.open(src)) {
             List<CentralEntry> entries = readCentralDirectory(ras);
             if (entries == null) {

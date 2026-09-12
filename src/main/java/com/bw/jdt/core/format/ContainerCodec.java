@@ -2,6 +2,7 @@ package com.bw.jdt.core.format;
 
 import com.bw.jdt.core.ByteSource;
 import com.bw.jdt.core.ContainerFormat;
+import com.bw.jdt.core.DecomposeLimits;
 import com.bw.jdt.core.WorkDir;
 
 import java.io.IOException;
@@ -26,7 +27,7 @@ public interface ContainerCodec {
      * @return the split of {@code src} into codec private metadata plus decompressed entry
      *         payloads, or {@code null} if this container cannot be reproduced exactly
      */
-    Decomposition decompose(ByteSource src, WorkDir wd) throws IOException;
+    Decomposition decompose(ByteSource src, WorkDir wd, DecomposeLimits limits) throws IOException;
 
     /** Writes the original container bytes given the metadata and the payloads in order. */
     void rebuild(byte[] meta, List<ByteSource> parts, OutputStream out) throws IOException;

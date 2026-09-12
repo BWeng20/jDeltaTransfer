@@ -85,7 +85,7 @@ class RoundTripTest {
         try (ChunkStore store = ChunkStore.open(tmp.resolve("blocks"));
              WorkDir wd = WorkDir.createTemp(tmp.resolve("work"), "d-")) {
             Blueprint bp = new Decomposer(store, Chunker.Params.of(65536, 4 << 20),
-                    Decomposer.DEFAULT_MAX_DEPTH, listener).decompose(ByteSource.ofFile(archive), wd);
+                    DecomposeLimits.DEFAULT, Decomposer.DEFAULT_MAX_DEPTH, listener).decompose(ByteSource.ofFile(archive), wd);
 
             assertTrue(seen.contains(ContainerFormat.ZIP), "outer and nested ZIPs must be opened");
             assertTrue(seen.contains(ContainerFormat.CAB), "nested CABs must be opened, saw " + seen);

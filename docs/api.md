@@ -96,7 +96,8 @@ The limits a client has to honour, plus block store statistics.
   "blockSizeAvg" : 65536,
   "blockSizeMax" : 262144,
   "storedBlocks" : 74508,
-  "storedBlockBytes" : 5491555168
+  "storedBlockBytes" : 5491555168,
+  "maxSevenZDecomposeSize" : 536870912
 }
 ```
 
@@ -108,6 +109,13 @@ The limits a client has to honour, plus block store statistics.
 | `blockSizeMax` | int | Largest block the chunker actually emits, derived from `blockSizeAvg` and clamped by `maxBlockSize`. |
 | `storedBlocks` | int64 | Distinct blocks across all versions. |
 | `storedBlockBytes` | int64 | Payload bytes in the block store. Far below the sum of all archive sizes, because versions share blocks. |
+| `maxSevenZDecomposeSize` | int64 | The server's `--max-7z-size`: largest nested 7z opened up rather than carried as opaque blocks. **Informational only** — see below. |
+
+`maxSevenZDecomposeSize` is reported for operators, not for clients to act on. The authoritative
+value for a given version travels inside that version's blueprint, because the client must
+decompose its local base under the same policy that produced the blueprint it is fetching. A
+server whose configuration changed after ingest therefore still serves consistent deltas for the
+versions it ingested earlier.
 
 `blockSizeMax <= maxBlockSize` always holds. The two differ whenever the average leaves room
 below the hard limit — with the defaults above, blocks stay at or below 256 KiB even though
@@ -157,10 +165,11 @@ Payload layout (after gunzip), big endian, produced and parsed by `BlueprintCode
 
 ```
 magic      "JDTBP"            5 bytes
-version    1                  uint8
+version    2                  uint8   (version 1 is still accepted on read)
 archive    sha256             32 bytes
 size       archive size       int64
 chunkMin / chunkAvg / chunkMax               3 x int32
+max7zSize  decompose limit    int64   (version 2 and later; defaults to 512 MiB for version 1)
 root       node
 
 node := 0x00 | size:int64 | n:int32 | n x (sha256[32], length:int32)      -- blob

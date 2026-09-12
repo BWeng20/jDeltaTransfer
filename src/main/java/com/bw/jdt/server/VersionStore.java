@@ -10,6 +10,7 @@ import com.bw.jdt.core.ByteSource;
 import com.bw.jdt.core.ChunkStore;
 import com.bw.jdt.core.Chunker;
 import com.bw.jdt.core.ContainerFormat;
+import com.bw.jdt.core.DecomposeLimits;
 import com.bw.jdt.core.Decomposer;
 import com.bw.jdt.core.Hashes;
 import com.bw.jdt.core.Reassembler;
@@ -55,6 +56,7 @@ public final class VersionStore implements Closeable {
     private final Map<String, VersionInfo> versions = new LinkedHashMap<>();
     private final ReentrantLock writeLock = new ReentrantLock();
     private volatile int ingestThreads = 1;
+    private volatile DecomposeLimits limits = DecomposeLimits.DEFAULT;
 
     /** Everything the HTTP API publishes about one archive version. */
     public record VersionInfo(
@@ -124,6 +126,15 @@ public final class VersionStore implements Closeable {
     }
 
     // ------------------------------------------------------------------ read
+
+    /** How far decomposition goes; travels to the client inside every blueprint. */
+    public void setLimits(DecomposeLimits limits) {
+        this.limits = limits;
+    }
+
+    public DecomposeLimits limits() {
+        return limits;
+    }
 
     /** How many archives may be decomposed at once during a scan. */
     public void setIngestThreads(int threads) {
@@ -233,17 +244,17 @@ public final class VersionStore implements Closeable {
             long t0 = System.nanoTime();
             ByteSource src = ByteSource.ofFile(archive);
 
-            long[] containers = {0};
-            long[] opaque = {0};
+            java.util.concurrent.atomic.AtomicLong containers = new java.util.concurrent.atomic.AtomicLong();
+            java.util.concurrent.atomic.AtomicLong opaque = new java.util.concurrent.atomic.AtomicLong();
             Decomposer.Listener listener = new Decomposer.Listener() {
                 @Override
                 public void onContainer(ContainerFormat format, int depth, long size) {
-                    containers[0]++;
+                    containers.incrementAndGet();
                 }
 
                 @Override
                 public void onOpaque(ContainerFormat attempted, int depth, long size) {
-                    opaque[0]++;
+                    opaque.incrementAndGet();
                     log.warn("  " + attempted + " at depth " + depth + " (" + size
                             + " bytes) cannot be rebuilt exactly, kept as opaque blocks");
                 }
@@ -251,7 +262,8 @@ public final class VersionStore implements Closeable {
 
             Blueprint bp;
             try (WorkDir wd = WorkDir.createTemp(storeDir.resolve("tmp"), "ingest-")) {
-                Decomposer decomposer = new Decomposer(blocks, chunkParams, Decomposer.DEFAULT_MAX_DEPTH, listener);
+                Decomposer decomposer = new Decomposer(blocks, chunkParams, limits,
+                        Decomposer.DEFAULT_MAX_DEPTH, listener);
                 bp = decomposer.decompose(src, wd);
                 if (verifyOnIngest) {
                     try (WorkDir vwd = WorkDir.createTemp(storeDir.resolve("tmp"), "verify-")) {
@@ -276,8 +288,8 @@ public final class VersionStore implements Closeable {
                     bpBytes.length,
                     stats.chunkRefs(),
                     stats.distinctChunks(),
-                    containers[0],
-                    opaque[0],
+                    containers.get(),
+                    opaque.get(),
                     Instant.now().toString());
 
             // Only the index update is serialised; decomposition above runs concurrently.
@@ -298,7 +310,7 @@ public final class VersionStore implements Closeable {
                     "ingested %s: %s, sha256=%s, %d blocks (%d distinct), %d containers, "
                             + "block store now %s, %.1fs",
                     id, human(info.size()), info.sha256().substring(0, 16),
-                    stats.chunkRefs(), stats.distinctChunks(), containers[0],
+                    stats.chunkRefs(), stats.distinctChunks(), containers.get(),
                     human(blocks.storedBytes()), ms / 1000.0));
             return info;
         }

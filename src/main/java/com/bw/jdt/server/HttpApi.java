@@ -91,6 +91,7 @@ public final class HttpApi implements AutoCloseable {
         n.put("blockSizeMax", p.max());
         n.put("storedBlocks", store.blocks().chunkCount());
         n.put("storedBlockBytes", store.blocks().storedBytes());
+        n.put("maxSevenZDecomposeSize", store.limits().maxSevenZBytes());
         sendJson(e, 200, n);
     }
 

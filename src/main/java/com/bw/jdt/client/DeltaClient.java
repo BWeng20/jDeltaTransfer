@@ -8,6 +8,7 @@ import com.bw.jdt.core.ByteSource;
 import com.bw.jdt.core.ChunkSource;
 import com.bw.jdt.core.ChunkStore;
 import com.bw.jdt.core.Chunker;
+import com.bw.jdt.core.DecomposeLimits;
 import com.bw.jdt.core.Decomposer;
 import com.bw.jdt.core.Fmt;
 import com.bw.jdt.core.Hash;
@@ -40,6 +41,8 @@ public final class DeltaClient implements Closeable {
     private final ObjectMapper json = new ObjectMapper();
     private final Path cacheDir;
     private final Log log;
+    private boolean keepBaseCache;
+    private int indexThreads = Math.min(8, Runtime.getRuntime().availableProcessors());
 
     public interface Log {
         void info(String message);
@@ -57,6 +60,21 @@ public final class DeltaClient implements Closeable {
                 .build();
     }
 
+    /** Entries of the base archive decomposed in parallel while indexing it. */
+    public DeltaClient indexThreads(int threads) {
+        this.indexThreads = Math.max(1, threads);
+        return this;
+    }
+
+    /**
+     * Copy the index over to the new version instead of renaming it, keeping the base indexed
+     * as well. Costs a full copy of the cache; only needed when several bases stay in use.
+     */
+    public DeltaClient keepBaseCache(boolean keep) {
+        this.keepBaseCache = keep;
+        return this;
+    }
+
     /** Outcome of a transfer, so callers can report the delta efficiency. */
     public record TransferResult(
             String versionId,
@@ -66,7 +84,8 @@ public final class DeltaClient implements Closeable {
             long blockBytes,
             long blocksRequested,
             long blocksReused,
-            boolean delta) {
+            boolean delta,
+            Phases phases) {
 
         public long transferredBytes() {
             return blueprintBytes + blockBytes;
@@ -74,6 +93,21 @@ public final class DeltaClient implements Closeable {
 
         public double savedFraction() {
             return archiveSize == 0 ? 0 : 1.0 - (double) transferredBytes() / archiveSize;
+        }
+    }
+
+    /**
+     * Wall clock of the three phases of a delta transfer, in nanoseconds. Worth reporting
+     * because which one dominates decides what is worth optimising: indexing is pure local CPU,
+     * download scales with the link, and rebuild is CPU again.
+     */
+    public record Phases(long indexNanos, long downloadNanos, long rebuildNanos) {
+        public static final Phases NONE = new Phases(0, 0, 0);
+
+        public String describe() {
+            return "index " + Fmt.seconds(indexNanos)
+                    + ", download " + Fmt.seconds(downloadNanos)
+                    + ", rebuild " + Fmt.seconds(rebuildNanos);
         }
     }
 
@@ -104,6 +138,7 @@ public final class DeltaClient implements Closeable {
         long size = info.path("size").asLong();
         int maxBlock = config().path("maxBlockSize").asInt();
 
+        long tFull = System.nanoTime();
         Path tmp = tempNextTo(out);
         long[] blocks = {0};
         long received;
@@ -123,7 +158,8 @@ public final class DeltaClient implements Closeable {
             throw new IOException("full download hash mismatch: expected " + expected + ", got " + actual);
         }
         Files.move(tmp, out, StandardCopyOption.REPLACE_EXISTING);
-        return new TransferResult(id, size, actual, 0, received, blocks[0], 0, false);
+        return new TransferResult(id, size, actual, 0, received, blocks[0], 0, false,
+                new Phases(0, System.nanoTime() - tFull, 0));
     }
 
     /**
@@ -148,20 +184,28 @@ public final class DeltaClient implements Closeable {
         log.info("blueprint " + Fmt.human(bpBytes.length) + ", "
                 + bp.stats().distinctChunks() + " distinct blocks needed");
 
-        Path localStoreDir = localStoreFor(baseArchive, bp.chunkParams());
+        Path localStoreDir = localStoreFor(baseArchive, bp.chunkParams(), bp.limits());
         Path incomingDir = localStoreDir.resolveSibling(localStoreDir.getFileName() + "-incoming-" + id);
+        boolean handOver = false;
+        TransferResult result;
         try (ChunkStore local = ChunkStore.open(localStoreDir);
              ChunkStore incoming = ChunkStore.open(incomingDir)) {
+            long indexNanos = 0;
             if (local.chunkCount() == 0) {
                 log.info("indexing local base " + baseArchive.getFileName() + " ...");
                 long t0 = System.nanoTime();
                 try (WorkDir wd = WorkDir.createTemp(localStoreDir.resolve("tmp"), "base-")) {
-                    new Decomposer(local, bp.chunkParams())
+                    // Same block parameters and the same decomposition policy the server used
+                    // for the target version, otherwise the two sides would cut different blocks
+                    // out of identical content and nothing would be reusable.
+                    new Decomposer(local, bp.chunkParams(), bp.limits())
+                            .withThreads(indexThreads)
                             .decompose(ByteSource.ofFile(baseArchive), wd);
                 }
                 local.sync();
+                indexNanos = System.nanoTime() - t0;
                 log.info("indexed " + local.chunkCount() + " local blocks in "
-                        + (System.nanoTime() - t0) / 1_000_000_000 + "s");
+                        + Fmt.seconds(indexNanos));
             } else {
                 log.info("reusing cached index of the local base: " + local.chunkCount() + " blocks");
             }
@@ -179,10 +223,13 @@ public final class DeltaClient implements Closeable {
             log.info("need " + missing.size() + " of " + needed.size()
                     + " blocks from the server (" + reused + " reused locally)");
 
+            long tDownload = System.nanoTime();
             long blockBytes = missing.isEmpty() ? 0 : downloadBlocks(id, missing, maxBlock, incoming);
             incoming.sync();
+            long downloadNanos = System.nanoTime() - tDownload;
 
             ChunkSource source = ChunkSource.composite(List.of(local, incoming));
+            long tRebuild = System.nanoTime();
             Path tmp = tempNextTo(out);
             try (WorkDir wd = WorkDir.createTemp(incomingDir.resolve("tmp"), "rebuild-");
                  OutputStream os = new BufferedOutputStream(Files.newOutputStream(tmp), 1 << 20)) {
@@ -197,12 +244,25 @@ public final class DeltaClient implements Closeable {
                 throw e;
             }
             Files.move(tmp, out, StandardCopyOption.REPLACE_EXISTING);
+            long rebuildNanos = System.nanoTime() - tRebuild;
 
-            return new TransferResult(id, size, expected, bpBytes.length, blockBytes,
-                    missing.size(), reused, true);
+            // Fold the downloaded blocks into the base index so the two together describe the
+            // version just built. The directory is relabelled below, once both stores are shut.
+            local.importFrom(incoming);
+            handOver = true;
+
+            Phases phases = new Phases(indexNanos, downloadNanos, rebuildNanos);
+            log.info("phases: " + phases.describe());
+            result = new TransferResult(id, size, expected, bpBytes.length, blockBytes,
+                    missing.size(), reused, true, phases);
         } finally {
             deleteRecursively(incomingDir);
         }
+        // Both stores are closed now, so the directory can be renamed.
+        if (handOver) {
+            handOverCache(localStoreDir, expected, bp.chunkParams(), bp.limits());
+        }
+        return result;
     }
 
     private static void deleteRecursively(Path dir) {
@@ -235,13 +295,69 @@ public final class DeltaClient implements Closeable {
 
     // --------------------------------------------------------------- helpers
 
-    /** Cache location for the decomposed local base, keyed by its content hash. */
-    private Path localStoreFor(Path baseArchive, Chunker.Params params) throws IOException {
-        Hash baseHash = Hashes.ofFile(baseArchive);
-        String key = baseHash.hex().substring(0, 24) + "-" + params.avg() + "-" + params.max();
-        Path dir = cacheDir.resolve(key);
+    /**
+     * Cache location for the decomposed local base. Keyed by the base's content hash and by
+     * every parameter that changes which blocks come out of it, so a cache built under one
+     * policy is never reused under another.
+     */
+    private Path localStoreFor(Path baseArchive, Chunker.Params params, DecomposeLimits limits)
+            throws IOException {
+        Path dir = cacheDir.resolve(cacheKey(Hashes.ofFile(baseArchive), params, limits));
         Files.createDirectories(dir);
         return dir;
+    }
+
+    private static String cacheKey(Hash archiveHash, Chunker.Params params, DecomposeLimits limits) {
+        return archiveHash.hex().substring(0, 24) + "-" + params.avg() + "-" + params.max()
+                + "-7z" + limits.maxSevenZBytes();
+    }
+
+    /**
+     * Relabels the base's index as the index of the version just rebuilt.
+     *
+     * <p>After a successful transfer the base index plus the downloaded blocks together already
+     * cover every block of the new version, so the next run -- a fresh process upgrading from
+     * exactly this file -- can skip decomposing it, which is otherwise close to half of the
+     * total time. Renaming is essentially free compared to re-indexing.
+     *
+     * <p>The base's own index is consumed in the process. That is the right trade for a client
+     * that upgrades forward one version at a time; pass {@code --keep-base-cache} to copy
+     * instead of rename when several bases have to stay indexed.
+     */
+    private void handOverCache(Path localStoreDir, Hash newVersionHash,
+                               Chunker.Params params, DecomposeLimits limits) {
+        Path target = cacheDir.resolve(cacheKey(newVersionHash, params, limits));
+        if (target.equals(localStoreDir)) {
+            return;
+        }
+        try {
+            if (Files.exists(target)) {
+                // The next version is already indexed; nothing to hand over.
+                return;
+            }
+            if (keepBaseCache) {
+                copyDirectory(localStoreDir, target);
+                log.info("indexed the new version into " + target.getFileName() + " (base kept)");
+            } else {
+                Files.move(localStoreDir, target);
+                log.info("cache handed over to " + target.getFileName()
+                        + "; the next upgrade from this file skips indexing");
+            }
+        } catch (IOException e) {
+            // Purely an optimisation: the next run just indexes again.
+            log.info("could not hand the cache over (" + e.getMessage() + "), next run will re-index");
+        }
+    }
+
+    private static void copyDirectory(Path from, Path to) throws IOException {
+        Files.createDirectories(to);
+        try (var s = Files.list(from)) {
+            for (Path p : s.toList()) {
+                if (Files.isRegularFile(p)) {
+                    Files.copy(p, to.resolve(p.getFileName()), StandardCopyOption.REPLACE_EXISTING);
+                }
+            }
+        }
     }
 
     private byte[] getBytes(String path) throws IOException, InterruptedException {

@@ -8,7 +8,9 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.Collections;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -155,6 +157,31 @@ public final class ChunkStore implements ChunkSource, Closeable {
 
     public void copyTo(Hash hash, OutputStream out) throws IOException {
         out.write(get(hash));
+    }
+
+    /** The blocks currently held, as an unmodifiable snapshot-ish view. */
+    public Set<Hash> hashes() {
+        return Collections.unmodifiableSet(locations.keySet());
+    }
+
+    /**
+     * Copies every block of {@code other} that is missing here.
+     *
+     * <p>Used to hand a client's base index over to the version it has just rebuilt: the old
+     * index plus the freshly downloaded blocks together already describe the new version, so
+     * the next run does not have to decompose it again.
+     *
+     * @return number of blocks actually added
+     */
+    public int importFrom(ChunkStore other) throws IOException {
+        int added = 0;
+        for (Hash h : other.hashes()) {
+            if (!contains(h) && put(h, other.get(h))) {
+                added++;
+            }
+        }
+        sync();
+        return added;
     }
 
     /** Flushes pack and index so a crash cannot lose acknowledged chunks. */

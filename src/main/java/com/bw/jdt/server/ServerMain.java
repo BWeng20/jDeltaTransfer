@@ -2,6 +2,7 @@ package com.bw.jdt.server;
 
 import com.bw.jdt.Args;
 import com.bw.jdt.core.Chunker;
+import com.bw.jdt.core.DecomposeLimits;
 
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -18,6 +19,8 @@ import java.nio.file.Paths;
  * --avg-block-size SZ   target average block size                 (default: 64KiB)
  * --threads N           HTTP worker threads                       (default: cores)
  * --ingest-threads N    archives decomposed in parallel on scan   (default: cores/2, max 4)
+ * --max-7z-size SZ      largest nested 7z opened up instead of        (default: 512MiB)
+ *                       being carried as opaque blocks
  * --verify true|false   rebuild-and-compare after each ingest      (default: true)
  * --force-reindex       discard blocks and blueprints, ingest again
  * --no-scan             do not ingest on startup
@@ -66,7 +69,12 @@ public final class ServerMain {
         log.info("block size min=" + params.min() + " avg=" + params.avg() + " max=" + params.max()
                 + " (hard limit " + maxBlock + ")");
 
+        long maxSevenZ = args.getBytes("max-7z-size", DecomposeLimits.DEFAULT_MAX_SEVEN_Z);
+        log.info("nested 7z opened up to " + maxSevenZ + " bytes"
+                + (maxSevenZ == DecomposeLimits.DEFAULT_MAX_SEVEN_Z ? " (default)" : ""));
+
         VersionStore store = VersionStore.open(storeDir, archiveDir, params, verify, forceReindex);
+        store.setLimits(new DecomposeLimits(maxSevenZ));
         store.setIngestThreads(args.getInt("ingest-threads",
                 Math.max(1, Math.min(4, Runtime.getRuntime().availableProcessors() / 2))));
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
@@ -101,6 +109,9 @@ public final class ServerMain {
                   --avg-block-size SZ   target average block size (default: 64KiB)
                   --threads N           HTTP worker threads (default: number of cores)
                   --ingest-threads N    archives decomposed in parallel on scan (default: cores/2, max 4)
+                  --max-7z-size SZ      largest nested 7z opened up rather than carried as opaque
+                                        blocks (default: 512MiB). Raising it shrinks deltas but
+                                        costs LZMA2 time on every rebuild, on the client too.
                   --verify true|false   rebuild and compare after each ingest (default: true)
                   --force-reindex       discard blocks and blueprints and ingest again
                   --no-scan             do not ingest archives on startup
