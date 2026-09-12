@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jdeltatransfer.invalid/schema/store-index.schema.json",
+  "title": "StoreIndex",
+  "description": "On disk format of STORE/index.json, the server's persistent hash record. Written with an atomic replace, so it is never observed half updated. This is server state, not an API response: it carries no sizeHuman and no per entry hashAlgorithm.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["formatVersion", "hashAlgorithm", "chunkMin", "chunkAvg", "chunkMax", "versions"],
+  "properties": {
+    "formatVersion": {
+      "type": "integer",
+      "const": 1,
+      "description": "Format of this file. The server refuses to start on an unknown value rather than guessing."
+    },
+    "hashAlgorithm": {
+      "type": "string",
+      "const": "SHA-256",
+      "description": "Algorithm behind every hash in this file."
+    },
+    "chunkMin": {
+      "type": "integer",
+      "description": "Block parameters the store was built with. Block boundaries depend on them, so starting the server with different values is refused: mixing them would silently destroy deduplication between versions. Use --force-reindex to rebuild the store instead.",
+      "minimum": 64
+    },
+    "chunkAvg": {
+      "type": "integer",
+      "minimum": 1024,
+      "description": "See chunkMin."
+    },
+    "chunkMax": {
+      "type": "integer",
+      "minimum": 1024,
+      "description": "See chunkMin."
+    },
+    "versions": {
+      "type": "array",
+      "description": "One entry per ingested archive, ordered by id ascending.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "fileName",
+          "size",
+          "sha256",
+          "blueprintSha256",
+          "blueprintBytes",
+          "blockRefs",
+          "distinctBlocks",
+          "containers",
+          "opaqueContainers",
+          "ingestedAt"
+        ],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "fileName": {"type": "string"},
+          "size": {"type": "integer", "minimum": 0},
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "blueprintSha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "blueprintBytes": {"type": "integer", "minimum": 0},
+          "blockRefs": {"type": "integer", "minimum": 0},
+          "distinctBlocks": {"type": "integer", "minimum": 0},
+          "containers": {"type": "integer", "minimum": 0},
+          "opaqueContainers": {"type": "integer", "minimum": 0},
+          "ingestedAt": {"type": "string", "format": "date-time"}
+        }
+      }
+    }
+  }
+}

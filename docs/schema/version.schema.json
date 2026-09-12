@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jdeltatransfer.invalid/schema/version.schema.json",
+  "title": "Version",
+  "description": "One archive version as published by GET /api/versions and GET /api/versions/{id}.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "fileName",
+    "size",
+    "sizeHuman",
+    "hashAlgorithm",
+    "sha256",
+    "blueprintSha256",
+    "blueprintBytes",
+    "blockRefs",
+    "distinctBlocks",
+    "containers",
+    "opaqueContainers",
+    "ingestedAt"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "description": "Stable identifier, derived from the archive file name without its extension. Used in every /api/versions/{id}/... path.",
+      "minLength": 1,
+      "examples": ["archive-v02"]
+    },
+    "fileName": {
+      "type": "string",
+      "description": "Name of the archive file inside the server's --archives directory.",
+      "examples": ["archive-v02.zip"]
+    },
+    "size": {
+      "type": "integer",
+      "description": "Size of the archive in bytes.",
+      "minimum": 0,
+      "examples": [1232488984]
+    },
+    "sizeHuman": {
+      "type": "string",
+      "description": "Human readable rendering of size. Informational only; never parse this, use size.",
+      "examples": ["1.15 GiB"]
+    },
+    "hashAlgorithm": {
+      "type": "string",
+      "const": "SHA-256",
+      "description": "Algorithm behind every hash field in this document."
+    },
+    "sha256": {
+      "type": "string",
+      "description": "SHA-256 of the complete archive file, lower case hex. This is the value the client verifies its rebuilt file against.",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "blueprintSha256": {
+      "type": "string",
+      "description": "SHA-256 of the gzipped blueprint served by GET /api/versions/{id}/blueprint. Lets a client cache the blueprint and detect a changed one.",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "blueprintBytes": {
+      "type": "integer",
+      "description": "Size of the gzipped blueprint in bytes. Part of what a delta transfer costs.",
+      "minimum": 0
+    },
+    "blockRefs": {
+      "type": "integer",
+      "description": "Number of block references in the blueprint, counting repeats.",
+      "minimum": 0
+    },
+    "distinctBlocks": {
+      "type": "integer",
+      "description": "Number of distinct blocks the version needs. Never larger than blockRefs; the difference is deduplication inside this one version.",
+      "minimum": 0
+    },
+    "containers": {
+      "type": "integer",
+      "description": "Nested archive containers that were decomposed, including the outer archive itself.",
+      "minimum": 0
+    },
+    "opaqueContainers": {
+      "type": "integer",
+      "description": "Containers that looked like an archive but could not be reproduced byte for byte and are therefore transferred as plain blocks. Correctness is unaffected; a value above 0 only means the delta for this version is larger than it could be.",
+      "minimum": 0
+    },
+    "ingestedAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "UTC instant at which the server decomposed this archive (ISO-8601).",
+      "examples": ["2026-09-12T16:18:08.915744100Z"]
+    }
+  }
+}

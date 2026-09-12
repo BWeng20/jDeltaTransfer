@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jdeltatransfer.invalid/schema/rescan.schema.json",
+  "title": "RescanResult",
+  "description": "Response of POST /api/rescan.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["ingested", "total"],
+  "properties": {
+    "ingested": {
+      "type": "integer",
+      "description": "Archives newly decomposed by this rescan. 0 means nothing in the archive directory was unknown.",
+      "minimum": 0
+    },
+    "total": {
+      "type": "integer",
+      "description": "Versions the server holds after the rescan.",
+      "minimum": 0
+    }
+  }
+}

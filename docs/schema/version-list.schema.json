@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jdeltatransfer.invalid/schema/version-list.schema.json",
+  "title": "VersionList",
+  "description": "Response of GET /api/versions: every version the server holds, with its hashes.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["hashAlgorithm", "count", "versions"],
+  "properties": {
+    "hashAlgorithm": {
+      "type": "string",
+      "const": "SHA-256",
+      "description": "Algorithm behind every hash in this response."
+    },
+    "count": {
+      "type": "integer",
+      "description": "Number of entries in versions.",
+      "minimum": 0
+    },
+    "versions": {
+      "type": "array",
+      "description": "All versions, ordered by id ascending.",
+      "items": {
+        "$ref": "version.schema.json"
+      }
+    }
+  }
+}

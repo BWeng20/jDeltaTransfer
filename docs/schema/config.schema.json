@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jdeltatransfer.invalid/schema/config.schema.json",
+  "title": "ServerConfig",
+  "description": "Response of GET /api/config: the block size limits a client has to honour, plus block store statistics.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "hashAlgorithm",
+    "maxBlockSize",
+    "blockSizeMin",
+    "blockSizeAvg",
+    "blockSizeMax",
+    "storedBlocks",
+    "storedBlockBytes"
+  ],
+  "properties": {
+    "hashAlgorithm": {
+      "type": "string",
+      "const": "SHA-256",
+      "description": "Algorithm used for archive hashes and for the per block hashes in the framing."
+    },
+    "maxBlockSize": {
+      "type": "integer",
+      "description": "The server's --max-block-size argument: the hard upper bound for any block on the wire. A client must reject a larger frame. Always >= blockSizeMax.",
+      "minimum": 1024,
+      "examples": [4194304]
+    },
+    "blockSizeMin": {
+      "type": "integer",
+      "description": "Lower bound the content defined chunker observes, except for the last block of a payload.",
+      "minimum": 64
+    },
+    "blockSizeAvg": {
+      "type": "integer",
+      "description": "Target average block size the chunker aims at. A power of two.",
+      "minimum": 1024
+    },
+    "blockSizeMax": {
+      "type": "integer",
+      "description": "Largest block the chunker will actually emit. Derived from blockSizeAvg and clamped by maxBlockSize.",
+      "minimum": 1024
+    },
+    "storedBlocks": {
+      "type": "integer",
+      "description": "Distinct blocks currently in the server's block store, across all versions.",
+      "minimum": 0
+    },
+    "storedBlockBytes": {
+      "type": "integer",
+      "description": "Total payload bytes in the block store. Smaller than the sum of all archive sizes because versions share blocks.",
+      "minimum": 0
+    }
+  }
+}
