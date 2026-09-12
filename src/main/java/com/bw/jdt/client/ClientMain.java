@@ -49,6 +49,8 @@ public final class ClientMain {
         try (DeltaClient client = new DeltaClient(server, cache, log)
                 .keepBaseCache(args.has("keep-base-cache"))
                 .indexThreads(args.getInt("index-threads",
+                        Math.min(8, Runtime.getRuntime().availableProcessors())))
+                .rebuildThreads(args.getInt("rebuild-threads",
                         Math.min(8, Runtime.getRuntime().availableProcessors())))) {
             switch (command) {
                 case "list" -> printList(client.listVersions());
@@ -134,8 +136,10 @@ public final class ClientMain {
                   --cache DIR    where the decomposed local base is cached (default: ./jdt-client-cache)
                   --keep-base-cache  copy the index to the new version instead of renaming it,
                                      keeping the old base indexed as well
-                  --index-threads N  entries decomposed in parallel while indexing the base
-                                     (default: min(cores, 8))
+                  --index-threads N    entries decomposed in parallel while indexing the base
+                                       (default: min(cores, 8))
+                  --rebuild-threads N  nested archives rebuilt in parallel; this is the dominant
+                                       cost of a warm transfer (default: min(cores, 8))
                 """);
     }
 }

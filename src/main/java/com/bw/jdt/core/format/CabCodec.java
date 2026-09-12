@@ -102,7 +102,8 @@ public final class CabCodec implements ContainerCodec {
     }
 
     @Override
-    public void rebuild(byte[] metaBytes, List<ByteSource> parts, OutputStream out) throws IOException {
+    public void rebuild(byte[] metaBytes, List<ByteSource> parts, OutputStream out, int threads)
+            throws IOException {
         DataInputStream meta = new DataInputStream(new java.io.ByteArrayInputStream(metaBytes));
         out.write(readBytes(meta));
         int folderCount = meta.readInt();

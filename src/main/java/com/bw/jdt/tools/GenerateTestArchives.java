@@ -51,6 +51,7 @@ import java.util.zip.ZipOutputStream;
  * --remove-rate F     fraction of files dropped per step  (default: 0.01)
  * --threads N         versions generated in parallel      (default: min(cores, 4))
  * --deflate-level N   level for deflated entries          (default: 6)
+ * --outer-format F    outermost container: zip, cab or 7z (default: zip)
  * </pre>
  */
 public final class GenerateTestArchives {
@@ -58,6 +59,9 @@ public final class GenerateTestArchives {
     private static final int ZIP_BUCKETS = 4;
     private static final int CAB_BUCKETS = 3;
     private static final int SEVENZ_BUCKETS = 2;
+
+    /** Every container format that may sit at the top level. */
+    private static final List<String> OUTER_FORMATS = List.of("zip", "cab", "7z");
 
     private static final long MIN_FILE = 64L << 10;
     private static final long MAX_FILE = 16L << 20;
@@ -106,6 +110,12 @@ public final class GenerateTestArchives {
         double removeRate = args.getDouble("remove-rate", 0.01);
         int threads = args.getInt("threads", Math.min(4, Runtime.getRuntime().availableProcessors()));
         int level = args.getInt("deflate-level", 6);
+        String outerFormat = args.get("outer-format", "zip").toLowerCase(Locale.ROOT);
+        if (!OUTER_FORMATS.contains(outerFormat)) {
+            System.err.println("--outer-format must be one of " + OUTER_FORMATS);
+            System.exit(2);
+            return;
+        }
 
         Files.createDirectories(outDir);
 
@@ -142,7 +152,7 @@ public final class GenerateTestArchives {
         for (int v = 0; v < count; v++) {
             final int version = v + 1;
             final List<FileSpec> manifest = manifests.get(v);
-            futures.add(pool.submit((Callable<String>) () -> writeVersion(version, manifest, outDir, level)));
+            futures.add(pool.submit((Callable<String>) () -> writeVersion(version, manifest, outDir, level, outerFormat)));
         }
         pool.shutdown();
         List<String> lines = new ArrayList<>();
@@ -262,10 +272,11 @@ public final class GenerateTestArchives {
 
     // ------------------------------------------------------------- generation
 
-    private static String writeVersion(int version, List<FileSpec> manifest, Path outDir, int level)
-            throws IOException {
+    private static String writeVersion(int version, List<FileSpec> manifest, Path outDir, int level,
+                                       String outerFormat) throws IOException {
         String id = String.format(Locale.ROOT, "archive-v%02d", version);
-        Path target = outDir.resolve(id + ".zip");
+        String ext = "." + outerFormat;
+        Path target = outDir.resolve(id + ext);
         Path tmpDir = outDir.resolve(".tmp-" + id);
         Files.createDirectories(tmpDir);
         long t0 = System.nanoTime();
@@ -275,22 +286,11 @@ public final class GenerateTestArchives {
             nested.putAll(buildNestedCabs(manifest, tmpDir, level));
             nested.putAll(buildNestedSevenZ(manifest, tmpDir));
 
-            Path part = outDir.resolve(id + ".zip.part");
-            try (ZipOutputStream zip = new ZipOutputStream(
-                    new BufferedOutputStream(Files.newOutputStream(part), 1 << 20))) {
-                zip.setLevel(level);
-
-                byte[] manifestText = renderManifest(version, manifest);
-                putDeflated(zip, "manifest.txt", manifestText);
-
-                for (FileSpec f : manifest) {
-                    if (f.bucket() == Bucket.PLAIN) {
-                        putContent(zip, "content/" + f.name(), f, level);
-                    }
-                }
-                for (Map.Entry<String, Path> e : nested.entrySet()) {
-                    putStoredFile(zip, "nested/" + e.getKey(), e.getValue());
-                }
+            Path part = outDir.resolve(id + ext + ".part");
+            switch (outerFormat) {
+                case "7z" -> writeOuterSevenZ(part, version, manifest, nested);
+                case "cab" -> writeOuterCab(part, version, manifest, nested, level);
+                default -> writeOuterZip(part, version, manifest, nested, level);
             }
             Files.move(part, target, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
 
@@ -301,6 +301,113 @@ public final class GenerateTestArchives {
         } finally {
             deleteRecursively(tmpDir);
         }
+    }
+
+    private static void writeOuterZip(Path part, int version, List<FileSpec> manifest,
+                                      Map<String, Path> nested, int level) throws IOException {
+        try (ZipOutputStream zip = new ZipOutputStream(
+                new BufferedOutputStream(Files.newOutputStream(part), 1 << 20))) {
+            zip.setLevel(level);
+            putDeflated(zip, "manifest.txt", renderManifest(version, manifest));
+            for (FileSpec f : manifest) {
+                if (f.bucket() == Bucket.PLAIN) {
+                    putContent(zip, "content/" + f.name(), f, level);
+                }
+            }
+            for (Map.Entry<String, Path> e : nested.entrySet()) {
+                putStoredFile(zip, "nested/" + e.getKey(), e.getValue());
+            }
+        }
+    }
+
+    /** Same content, but with a cabinet as the outermost container. */
+    private static void writeOuterCab(Path part, int version, List<FileSpec> manifest,
+                                      Map<String, Path> nested, int level) throws IOException {
+        byte[] manifestText = renderManifest(version, manifest);
+        List<CabWriter.Entry> entries = new ArrayList<>();
+        entries.add(cabEntry("manifest.txt", manifestText.length,
+                () -> new java.io.ByteArrayInputStream(manifestText)));
+        for (FileSpec f : manifest) {
+            if (f.bucket() == Bucket.PLAIN) {
+                entries.add(cabEntry("content/" + f.name(), f.size(),
+                        () -> Content.open(f.id(), f.revision(), f.size(), f.kind())));
+            }
+        }
+        for (Map.Entry<String, Path> e : nested.entrySet()) {
+            Path file = e.getValue();
+            entries.add(cabEntry("nested/" + e.getKey(), Files.size(file),
+                    () -> Files.newInputStream(file)));
+        }
+        new CabWriter(level).write(part, entries);
+    }
+
+    private static CabWriter.Entry cabEntry(String name, long size, StreamSupplier content) {
+        return new CabWriter.Entry() {
+            @Override
+            public String name() {
+                return name;
+            }
+
+            @Override
+            public long size() {
+                return size;
+            }
+
+            @Override
+            public InputStream open() throws IOException {
+                return content.open();
+            }
+        };
+    }
+
+    /**
+     * Same content, but with 7z as the outermost container. Useful for checking that nothing in
+     * the pipeline assumes the top level is a ZIP.
+     */
+    private static void writeOuterSevenZ(Path part, int version, List<FileSpec> manifest,
+                                         Map<String, Path> nested) throws IOException {
+        Files.deleteIfExists(part);
+        try (SevenZOutputFile sz = new SevenZOutputFile(part.toFile())) {
+            sz.setContentMethods(Collections.singletonList(new SevenZMethodConfiguration(SevenZMethod.LZMA2)));
+            byte[] manifestText = renderManifest(version, manifest);
+            addSevenZEntry(sz, "manifest.txt", manifestText.length, 0,
+                    () -> new java.io.ByteArrayInputStream(manifestText));
+            for (FileSpec f : manifest) {
+                if (f.bucket() == Bucket.PLAIN) {
+                    addSevenZEntry(sz, "content/" + f.name(), f.size(), f.id(),
+                            () -> Content.open(f.id(), f.revision(), f.size(), f.kind()));
+                }
+            }
+            for (Map.Entry<String, Path> e : nested.entrySet()) {
+                Path file = e.getValue();
+                addSevenZEntry(sz, "nested/" + e.getKey(), Files.size(file), 0,
+                        () -> Files.newInputStream(file));
+            }
+            sz.finish();
+        }
+    }
+
+    private interface StreamSupplier {
+        InputStream open() throws IOException;
+    }
+
+    private static void addSevenZEntry(SevenZOutputFile sz, String name, long size, long id,
+                                       StreamSupplier content) throws IOException {
+        SevenZArchiveEntry entry = new SevenZArchiveEntry();
+        entry.setName(name);
+        entry.setDirectory(false);
+        entry.setSize(size);
+        entry.setHasStream(true);
+        entry.setLastModifiedDate(new java.util.Date(1_700_000_000_000L + id));
+        sz.putArchiveEntry(entry);
+        try (InputStream in = content.open()) {
+            byte[] buf = new byte[1 << 16];
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                sz.write(buf, 0, n);
+            }
+        }
+        sz.closeArchiveEntry();
     }
 
     private static Map<String, Path> buildNestedZips(List<FileSpec> manifest, Path tmpDir, int level)
@@ -517,6 +624,7 @@ public final class GenerateTestArchives {
                   --remove-rate F     fraction of files dropped per version (default: 0.01)
                   --threads N         versions generated in parallel (default: min(cores, 4))
                   --deflate-level N   level for deflated entries (default: 6)
+                  --outer-format F    outermost container: zip, cab or 7z (default: zip)
 
                 Each version is an outer ZIP with plain files plus nested ZIP, CAB and 7z archives.
                 """);

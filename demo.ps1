@@ -33,7 +33,8 @@ Write-Host "server has $($versions.Count) versions" -ForegroundColor Cyan
 $results = @()
 $previous = $null
 foreach ($v in $versions) {
-    $target = Join-Path $Work "$($v.id).zip"
+    # Keep the server's own file name: the outermost container may be ZIP, CAB or 7z.
+    $target = Join-Path $Work $v.fileName
     $sw = [Diagnostics.Stopwatch]::StartNew()
     if ($null -eq $previous) {
         $log = Invoke-Jdt @('fetch', '--server', $Server, '--cache', $cache,

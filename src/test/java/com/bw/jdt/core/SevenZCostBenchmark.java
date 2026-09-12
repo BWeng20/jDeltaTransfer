@@ -59,7 +59,7 @@ class SevenZCostBenchmark {
                 // Rebuild alone: this is what a client pays on every single delta transfer.
                 long t2 = System.nanoTime();
                 try (OutputStream out = OutputStream.nullOutputStream()) {
-                    new SevenZCodec().rebuild(d.meta(), d.parts(), out);
+                    new SevenZCodec().rebuild(d.meta(), d.parts(), out, 1);
                 }
                 long rebuildNs = System.nanoTime() - t2;
 

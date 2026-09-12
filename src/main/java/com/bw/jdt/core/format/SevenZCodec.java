@@ -81,7 +81,7 @@ public final class SevenZCodec implements ContainerCodec {
             try {
                 Path probe = wd.newFile(".7z");
                 try (OutputStream out = Files.newOutputStream(probe)) {
-                    rebuild(meta, parts, out);
+                    rebuild(meta, parts, out, 1);
                 }
                 if (Hashes.ofFile(probe).equals(want)) {
                     Files.deleteIfExists(probe);
@@ -96,7 +96,8 @@ public final class SevenZCodec implements ContainerCodec {
     }
 
     @Override
-    public void rebuild(byte[] metaBytes, List<ByteSource> parts, OutputStream out) throws IOException {
+    public void rebuild(byte[] metaBytes, List<ByteSource> parts, OutputStream out, int threads)
+            throws IOException {
         DataInputStream meta = new DataInputStream(new java.io.ByteArrayInputStream(metaBytes));
         SevenZMethod method = SevenZMethod.valueOf(meta.readUTF());
         int count = meta.readInt();

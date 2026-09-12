@@ -43,6 +43,7 @@ public final class DeltaClient implements Closeable {
     private final Log log;
     private boolean keepBaseCache;
     private int indexThreads = Math.min(8, Runtime.getRuntime().availableProcessors());
+    private int rebuildThreads = Math.min(8, Runtime.getRuntime().availableProcessors());
 
     public interface Log {
         void info(String message);
@@ -58,6 +59,12 @@ public final class DeltaClient implements Closeable {
                 .connectTimeout(Duration.ofSeconds(20))
                 .followRedirects(HttpClient.Redirect.NORMAL)
                 .build();
+    }
+
+    /** Nested archives rebuilt in parallel. This is the dominant cost of a warm transfer. */
+    public DeltaClient rebuildThreads(int threads) {
+        this.rebuildThreads = Math.max(1, threads);
+        return this;
     }
 
     /** Entries of the base archive decomposed in parallel while indexing it. */
@@ -233,7 +240,9 @@ public final class DeltaClient implements Closeable {
             Path tmp = tempNextTo(out);
             try (WorkDir wd = WorkDir.createTemp(incomingDir.resolve("tmp"), "rebuild-");
                  OutputStream os = new BufferedOutputStream(Files.newOutputStream(tmp), 1 << 20)) {
-                Hash actual = new Reassembler(source, wd).writeTo(bp, os);
+                Hash actual = new Reassembler(source, wd)
+                        .withThreads(rebuildThreads)
+                        .writeTo(bp, os);
                 os.flush();
                 if (!actual.equals(expected)) {
                     throw new IOException("rebuilt archive hash mismatch: expected " + expected

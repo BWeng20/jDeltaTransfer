@@ -12,8 +12,17 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.List;
 
 /**
@@ -126,30 +135,168 @@ public final class ZipCodec implements ContainerCodec {
     }
 
     @Override
-    public void rebuild(byte[] metaBytes, List<ByteSource> parts, OutputStream out) throws IOException {
-        DataInputStream meta = new DataInputStream(new java.io.ByteArrayInputStream(metaBytes));
-        int segmentCount = meta.readInt();
+    public void rebuild(byte[] metaBytes, List<ByteSource> parts, OutputStream out, int threads)
+            throws IOException {
+        List<Segment> segments = readSegments(metaBytes);
+        long deflated = segments.stream().filter(s -> s.inline == null && s.transform == TRANSFORM_DEFLATE)
+                .count();
+        Map<Integer, Staged> staged = threads > 1 && deflated > 1
+                ? deflateInParallel(segments, parts, threads)
+                : Map.of();
+        try {
+            writeSegments(segments, parts, staged, out);
+        } finally {
+            for (Staged s : staged.values()) {
+                s.discard();
+            }
+        }
+    }
+
+    /**
+     * Pre-compresses the deflated entries concurrently.
+     *
+     * <p>ZIP entries carry no shared compression state, so each one can be deflated on its own
+     * thread and the results written out in order afterwards. This matters: re-deflating the
+     * outer archive's own entries is the single largest serial stretch of a rebuild, larger than
+     * all the nested archives put together.
+     *
+     * <p>Small results stay in memory; anything sizeable goes to a temp file so that
+     * pre-compressing a multi gigabyte archive does not need a multi gigabyte heap.
+     */
+    private static Map<Integer, Staged> deflateInParallel(List<Segment> segments,
+                                                          List<ByteSource> parts, int threads)
+            throws IOException {
+        Map<Integer, Staged> staged = new HashMap<>();
+        ExecutorService pool = Executors.newFixedThreadPool(Math.min(threads, parts.size()));
+        Map<Integer, Future<Staged>> futures = new LinkedHashMap<>();
+        try {
+            int partIndex = 0;
+            for (Segment s : segments) {
+                if (s.inline != null) {
+                    continue;
+                }
+                int index = partIndex++;
+                if (s.transform != TRANSFORM_DEFLATE || index >= parts.size()) {
+                    continue;
+                }
+                ByteSource part = parts.get(index);
+                int level = s.level;
+                futures.put(index, pool.submit(() -> Staged.deflate(part, level)));
+            }
+            for (Map.Entry<Integer, Future<Staged>> e : futures.entrySet()) {
+                staged.put(e.getKey(), await(e.getValue()));
+            }
+            return staged;
+        } catch (IOException | RuntimeException e) {
+            for (Staged s : staged.values()) {
+                s.discard();
+            }
+            throw e;
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    private static void writeSegments(List<Segment> segments, List<ByteSource> parts,
+                                      Map<Integer, Staged> staged, OutputStream out)
+            throws IOException {
         int partIndex = 0;
-        for (int i = 0; i < segmentCount; i++) {
-            int kind = meta.readUnsignedByte();
-            if (kind == SEG_INLINE) {
-                out.write(meta.readNBytes(meta.readInt()));
+        for (Segment s : segments) {
+            if (s.inline != null) {
+                out.write(s.inline);
+                continue;
+            }
+            if (partIndex >= parts.size()) {
+                throw new IOException("blueprint references more payloads than available");
+            }
+            int index = partIndex++;
+            ByteSource part = parts.get(index);
+            Staged ready = staged.get(index);
+            if (ready != null) {
+                ready.copyTo(out);
+            } else if (s.transform == TRANSFORM_DEFLATE) {
+                DeflateSupport.deflate(part, s.level, out);
             } else {
-                int transform = meta.readUnsignedByte();
-                int level = meta.readUnsignedByte();
-                if (partIndex >= parts.size()) {
-                    throw new IOException("blueprint references more payloads than available");
-                }
-                ByteSource part = parts.get(partIndex++);
-                if (transform == TRANSFORM_DEFLATE) {
-                    DeflateSupport.deflate(part, level, out);
-                } else {
-                    part.copyTo(out);
-                }
+                part.copyTo(out);
             }
         }
         if (partIndex != parts.size()) {
             throw new IOException("unused payloads in ZIP rebuild: " + (parts.size() - partIndex));
+        }
+    }
+
+    private static List<Segment> readSegments(byte[] metaBytes) throws IOException {
+        DataInputStream meta = new DataInputStream(new java.io.ByteArrayInputStream(metaBytes));
+        int count = meta.readInt();
+        List<Segment> segments = new ArrayList<>(count);
+        for (int i = 0; i < count; i++) {
+            if (meta.readUnsignedByte() == SEG_INLINE) {
+                segments.add(Segment.inline(meta.readNBytes(meta.readInt())));
+            } else {
+                segments.add(Segment.part((byte) meta.readUnsignedByte(), meta.readUnsignedByte()));
+            }
+        }
+        return segments;
+    }
+
+    private static Staged await(Future<Staged> f) throws IOException {
+        try {
+            return f.get();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("rebuild interrupted", e);
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof IOException io) {
+                throw io;
+            }
+            if (cause instanceof RuntimeException re) {
+                throw re;
+            }
+            throw new IOException("parallel deflate failed", cause);
+        }
+    }
+
+    /** A pre-compressed entry, held in memory when small and in a temp file when not. */
+    private record Staged(byte[] memory, Path file) {
+
+        private static final int MEMORY_LIMIT = 1 << 20;
+
+        static Staged deflate(ByteSource part, int level) throws IOException {
+            if (part.size() <= MEMORY_LIMIT) {
+                java.io.ByteArrayOutputStream bos =
+                        new java.io.ByteArrayOutputStream((int) part.size() / 2 + 64);
+                DeflateSupport.deflate(part, level, bos);
+                return new Staged(bos.toByteArray(), null);
+            }
+            Path tmp = Files.createTempFile("jdt-deflate-", ".bin");
+            try (OutputStream os = new java.io.BufferedOutputStream(Files.newOutputStream(tmp), 1 << 16)) {
+                DeflateSupport.deflate(part, level, os);
+            } catch (IOException e) {
+                Files.deleteIfExists(tmp);
+                throw e;
+            }
+            return new Staged(null, tmp);
+        }
+
+        void copyTo(OutputStream out) throws IOException {
+            if (memory != null) {
+                out.write(memory);
+            } else {
+                try (java.io.InputStream in = Files.newInputStream(file)) {
+                    in.transferTo(out);
+                }
+            }
+        }
+
+        void discard() {
+            if (file != null) {
+                try {
+                    Files.deleteIfExists(file);
+                } catch (IOException ignored) {
+                    // Temp file will be cleaned up by the OS eventually.
+                }
+            }
         }
     }
 

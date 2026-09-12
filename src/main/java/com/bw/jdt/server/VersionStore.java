@@ -14,6 +14,7 @@ import com.bw.jdt.core.DecomposeLimits;
 import com.bw.jdt.core.Decomposer;
 import com.bw.jdt.core.Hashes;
 import com.bw.jdt.core.Reassembler;
+import com.bw.jdt.core.format.ArchiveSniffer;
 import com.bw.jdt.core.WorkDir;
 
 import java.io.Closeable;
@@ -136,6 +137,11 @@ public final class VersionStore implements Closeable {
         return limits;
     }
 
+    /** Spare cores for the verify rebuild, given that scan already runs archives in parallel. */
+    private int rebuildThreads() {
+        return Math.max(1, Runtime.getRuntime().availableProcessors() / Math.max(1, ingestThreads));
+    }
+
     /** How many archives may be decomposed at once during a scan. */
     public void setIngestThreads(int threads) {
         this.ingestThreads = Math.max(1, threads);
@@ -182,16 +188,35 @@ public final class VersionStore implements Closeable {
 
     /** Ingests every archive in the archive directory that is not indexed yet. */
     public int scan(Log log) throws IOException {
-        List<Path> candidates;
+        List<Path> files;
         try (Stream<Path> s = Files.list(archiveDir)) {
-            candidates = s.filter(Files::isRegularFile)
-                    .filter(p -> {
-                        String n = p.getFileName().toString().toLowerCase(Locale.ROOT);
-                        return n.endsWith(".zip") || n.endsWith(".cab") || n.endsWith(".7z");
-                    })
+            files = s.filter(Files::isRegularFile)
+                    .filter(VersionStore::notTransient)
                     .sorted()
                     .toList();
         }
+
+        // Any supported container may sit at the top level, and the format is decided by the
+        // magic bytes rather than by the extension -- the same rule the decomposer follows all
+        // the way down. A file named .dat or .pak that happens to be a cabinet is ingested too.
+        List<Path> candidates = new ArrayList<>();
+        Map<String, Path> byId = new LinkedHashMap<>();
+        for (Path file : files) {
+            ContainerFormat fmt = ArchiveSniffer.detect(ByteSource.ofFile(file));
+            if (fmt == null) {
+                continue;
+            }
+            String id = idFor(file);
+            Path clash = byId.putIfAbsent(id, file);
+            if (clash != null) {
+                log.warn("skipping " + file.getFileName() + ": its version id '" + id
+                        + "' is already taken by " + clash.getFileName()
+                        + ". Rename one of them to serve both.");
+                continue;
+            }
+            candidates.add(file);
+        }
+
         List<Path> pending = new ArrayList<>();
         for (Path archive : candidates) {
             String id = idFor(archive);
@@ -267,8 +292,9 @@ public final class VersionStore implements Closeable {
                 bp = decomposer.decompose(src, wd);
                 if (verifyOnIngest) {
                     try (WorkDir vwd = WorkDir.createTemp(storeDir.resolve("tmp"), "verify-")) {
-                        Reassembler re = new Reassembler(blocks, vwd);
-                        re.writeVerified(bp, OutputStream.nullOutputStream());
+                        new Reassembler(blocks, vwd)
+                                .withThreads(rebuildThreads())
+                                .writeVerified(bp, OutputStream.nullOutputStream());
                     }
                 }
             }
@@ -399,10 +425,24 @@ public final class VersionStore implements Closeable {
         }
     }
 
+    /**
+     * Version id: the file name without its extension.
+     *
+     * <p>Since any supported format may be the outermost container, two files can map to the
+     * same id ({@code app.zip} and {@code app.7z}). {@link #scan} detects that and skips the
+     * second rather than letting one silently replace the other in the index.
+     */
     private static String idFor(Path archive) {
         String name = archive.getFileName().toString();
         int dot = name.lastIndexOf('.');
         return dot > 0 ? name.substring(0, dot) : name;
+    }
+
+    /** Skips half written files, so a scan cannot pick up an archive that is still being copied. */
+    private static boolean notTransient(Path file) {
+        String n = file.getFileName().toString().toLowerCase(Locale.ROOT);
+        return !n.startsWith(".") && !n.endsWith(".part") && !n.endsWith(".tmp")
+                && !n.endsWith(".crdownload");
     }
 
     public static String human(long bytes) {

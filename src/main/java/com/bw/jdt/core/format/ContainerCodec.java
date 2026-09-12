@@ -29,8 +29,12 @@ public interface ContainerCodec {
      */
     Decomposition decompose(ByteSource src, WorkDir wd, DecomposeLimits limits) throws IOException;
 
-    /** Writes the original container bytes given the metadata and the payloads in order. */
-    void rebuild(byte[] meta, List<ByteSource> parts, OutputStream out) throws IOException;
+    /**
+     * Writes the original container bytes given the metadata and the payloads in order.
+     *
+     * @param threads how many independent re-encodes this codec may run at once; 1 means serial
+     */
+    void rebuild(byte[] meta, List<ByteSource> parts, OutputStream out, int threads) throws IOException;
 
     /**
      * @param meta  codec private description of headers, ordering and compression settings

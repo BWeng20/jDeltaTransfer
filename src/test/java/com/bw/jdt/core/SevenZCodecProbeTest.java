@@ -38,7 +38,7 @@ class SevenZCodecProbeTest {
 
             Path rebuilt = tmp.resolve("rebuilt.7z");
             try (OutputStream out = Files.newOutputStream(rebuilt)) {
-                new SevenZCodec().rebuild(d.meta(), d.parts(), out);
+                new SevenZCodec().rebuild(d.meta(), d.parts(), out, 1);
             }
             assertEquals(Hashes.ofFile(nested), Hashes.ofFile(rebuilt));
         }

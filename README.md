@@ -5,10 +5,12 @@
 Client and server for transferring successive versions of large nested archives by sending only
 what actually changed.
 
-The archives in question are ZIP files that contain further archives in **CAB**, **ZIP** and
-**7z** format. Both sides already hold an older version. The server can also serve a complete
-version. Every version has a SHA-256 that both sides compute and verify, and all payload travels
-as self describing blocks whose size is dynamic but bounded by a server side argument.
+The archives in question are nested: a container holding further archives in **ZIP**, **CAB** and
+**7z** format. Any of those three may be the outermost container as well — the format is decided
+by the magic bytes at every level, including the top, so file names are never trusted. Both sides
+already hold an older version. The server can also serve a complete version. Every version has a
+SHA-256 that both sides compute and verify, and all payload travels as self describing blocks
+whose size is dynamic but bounded by a server side argument.
 
 ---
 
@@ -22,7 +24,7 @@ onwards. The compressed representation has no locality.
 jDeltaTransfer therefore works on the **decompressed** content:
 
 ```
-archive-v07.zip                          <- ZIP container
+archive-v07.zip                          <- outer container (ZIP here; CAB or 7z work the same)
 ├── manifest.txt                         <- deflated entry      -> blocks of the plain text
 ├── content/f0001234.bin                 <- stored entry        -> blocks of the raw bytes
 ├── nested/data-01.zip                   <- ZIP container
@@ -153,10 +155,11 @@ Ten versions, ascending in size, starting at 1 GiB:
 jdt gen --out data/archives --count 10 --start-size 1GB --growth 0.15 --threads 6
 ```
 
-Every version is an outer ZIP with plain files plus nested ZIP, CAB and 7z archives. Version
-*n+1* is derived from version *n*: most files stay byte identical, a few get a new revision that
-rewrites a small region of their content, a few are dropped, and new ones are appended until the
-target size is reached — the way successive releases of a real product behave.
+Every version is an outer container — ZIP by default, `--outer-format cab|7z` for the others —
+holding plain files plus nested ZIP, CAB and 7z archives. Version *n+1* is derived from version
+*n*: most files stay byte identical, a few get a new revision that rewrites a small region of
+their content, a few are dropped, and new ones are appended until the target size is reached —
+the way successive releases of a real product behave.
 
 > This writes roughly **20 GiB**. Use `--start-size 64MB` for a quick look.
 
@@ -226,6 +229,7 @@ jdt client hash --file FILE          SHA-256 of a local file
 --cache DIR    where the decomposed base is cached (default: ./jdt-client-cache)
 --keep-base-cache  copy the index to the new version instead of renaming it
 --index-threads N  entries decomposed in parallel while indexing the base (default: min(cores, 8))
+--rebuild-threads N  nested archives and deflated entries rebuilt in parallel (default: min(cores, 8))
                One sub directory per base version, named by its hash. Nothing prunes it, so
                delete the sub directories of versions you no longer upgrade from.
 --version ID   version to fetch
@@ -282,6 +286,9 @@ most of their decompressed content.
 See `demo.ps1` for the script that produces the table below: it downloads the first version in
 full and then walks the chain, using each rebuilt version as the base for the next.
 
+All test in this Readme are measured on an AMD Ryzen 7 5700X 3.40 GHz.
+
+
 | version | mode  | archive     | transferred | saved  | verified | seconds |
 |---------|-------|-------------|-------------|--------|----------|---------|
 | v01     | full  | 1014.97 MiB | 1014.97 MiB |   —    | OK       |   5.8   |
@@ -325,7 +332,7 @@ first no longer pays for indexing at all.
 instead of being opened up. The default is 512 MiB. Raising it makes deltas smaller; the price is
 LZMA2 time, and it is worth knowing exactly where that time lands.
 
-Measured on an AMD Ryzen 7 5700X 3.40 GHz with `gradlew test --tests '*SevenZCostBenchmark*' -Pbench`
+Measured with `gradlew test --tests '*SevenZCostBenchmark*' -Pbench`
 (Commons Compress LZMA2, single threaded, throughput in uncompressed MB/s):
 
 | raw content | 7z size | decompose | rebuild | rebuild MB/s |
@@ -365,8 +372,8 @@ next version. Measured on the 1 GiB chain, per run:
 
 | run | index | download | rebuild | total |
 |-----|-------|----------|---------|-------|
-| first ever (cold cache) | 24.9 s | 1.1 s | 28.5 s | 56.4 s |
-| every later one | **0.0 s** | 1.8 s | 35.7 s | 39.9 s |
+| first ever (cold cache) | 21.2 s | 1.0 s | 10.5 s | 34.6 s |
+| every later one | **0.0 s** | 1.4 s | 12.4 s | **16.2 s** |
 
 Indexing disappears after the first run because of **cache handover**: once a transfer succeeds,
 the base's block index plus the freshly downloaded blocks already describe the version just
@@ -381,13 +388,71 @@ a full copy of the cache.
 `--index-threads` (default `min(cores, 8)`) decomposes the outermost archive's entries in
 parallel. It is worth less than it looks: 30.1 s single threaded against 23.7 s on sixteen, a
 speedup of only 1.27. Roughly three quarters of indexing is serial, because the deflate level
-probe runs inside the ZIP codec before the parallel section begins. Parallelising *that* is the
-real fix, but with handover in place indexing only ever runs once per machine, so it stopped
-being worth the complexity.
+probe runs inside the ZIP codec before the parallel section begins — the mirror image of the
+rebuild problem described next, and fixable the same way. It was left alone because with handover
+in place indexing only ever runs once per machine.
 
-**Rebuild is now the dominant cost** — around 89% of a warm run — and unlike indexing it happens
-every single time. The nested archives are independent subtrees, so rebuilding them concurrently
-is the next worthwhile step; it would also attack the LZMA2 cost described above.
+`--rebuild-threads` (default `min(cores, 8)`) attacks the phase that runs on *every* transfer.
+Two independent things happen in parallel:
+
+- the nested archives, which are independent subtrees, are rebuilt concurrently;
+- the outer archive's own deflated entries are pre-compressed concurrently. ZIP entries share no
+  compression state, so each can be deflated on its own thread and the results written out in
+  order. Small results stay in memory, larger ones go to a temp file, so pre-compressing a
+  multi gigabyte archive does not need a multi gigabyte heap.
+
+The second half is what actually pays. Parallelising only the nested archives got 28.2 s down to
+21.7 s, a mere 1.30, because re-deflating the outer archive's own entries is a longer serial
+stretch than all the nested archives put together. With both in place:
+
+| rebuild-threads | 1 | 8 | 16 |
+|-----------------|---|---|----|
+| rebuild | 27.9 s | 11.0 s | 10.0 s |
+| speedup | — | 2.54 | 2.79 |
+
+The rebuilt archive's SHA-256 is identical at every thread count, which `ParallelRebuildTest`
+pins down by comparing a serial and a parallel rebuild byte for byte.
+
+### Which format sits on top
+
+Any of the three. The server discovers versions by sniffing each file's magic bytes, so a cabinet
+called `bundle.pak` or a ZIP with no extension is ingested just the same; only obviously transient
+names (`.part`, `.tmp`, dotfiles) are skipped. `jdt gen --outer-format zip|cab|7z` produces the
+same content under each, and `TopLevelFormatTest` checks all three decompose, rebuild byte for
+byte, and keep their delta — block reuse between consecutive versions is **92% in every case**.
+
+One sharp edge: the version id is the file name without its extension, so `app.zip` and `app.7z`
+would collide. The scan reports that and skips the second rather than letting one silently replace
+the other in the index; rename one to serve both.
+
+#### 7z on top is the expensive choice
+
+The delta itself holds up — the outer solid stream is taken apart rather than treated as one
+blob — but the rebuild does not.
+
+Measured on a 126 MiB top level 7z with nine nested archives:
+
+| rebuild-threads | 1 | 8 | 16 |
+|-----------------|---|---|----|
+| rebuild | 38.7 s | 38.7 s | 38.7 s |
+| speedup | — | 1.00 | 1.00 |
+
+**Threads buy nothing here**, and no amount of engineering will change that. 7z packs its entries
+into a single solid LZMA2 stream, so unlike ZIP entries they are not independently compressed and
+cannot be re-encoded independently either. The nested archives inside still rebuild concurrently,
+but they are a rounding error next to one sequential LZMA2 pass over the whole container.
+
+Two consequences worth weighing before putting 7z on top:
+
+- Rebuild time scales with the container and stays serial. 38.7 s for 126 MiB extrapolates to
+  roughly five minutes for a gigabyte, on every transfer, on the client.
+- `--max-7z-size` applies to the outermost container as well. Above it the entire archive becomes
+  one opaque blob and the delta collapses to a full transfer — still correct, but pointless. A
+  multi gigabyte top level 7z therefore needs that limit raised, which costs exactly the LZMA2
+  time described above.
+
+ZIP on top with 7z nested inside gets the best of both: the outer entries parallelise, and the
+nested 7z containers are small enough for their solid streams not to dominate.
 
 One thing the handover cannot do: seed a cache from a `/full` download. Those blocks are cut over
 the *compressed* archive stream and live in a different block space than the blueprint's
