@@ -286,7 +286,7 @@ most of their decompressed content.
 See `demo.ps1` for the script that produces the table below: it downloads the first version in
 full and then walks the chain, using each rebuilt version as the base for the next.
 
-All test in this Readme are measured on an AMD Ryzen 7 5700X 3.40 GHz.
+All tests in this Readme are measured on an AMD Ryzen 7 5700X 3.40 GHz.
 
 
 | version | mode  | archive     | transferred | saved  | verified | seconds |
