@@ -284,7 +284,8 @@ opaque fallbacks, and every one passed the rebuild-and-compare check.
 The shared block store holds **5.2 GiB for all 20.2 GiB of archives**, because the versions share
 most of their decompressed content.
 
-See `demo.ps1` for the script that produces the table below: it downloads the first version in
+See `demo.ps1`, or `demo.sh` for the same thing outside Windows, for the script that produces the
+table below: it downloads the first version in
 full and then walks the chain, using each rebuilt version as the base for the next.
 
 All tests in this Readme are measured on an AMD Ryzen 7 5700X 3.40 GHz.
