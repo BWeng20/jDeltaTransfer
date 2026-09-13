@@ -46,7 +46,15 @@ public final class ClientMain {
         Path cache = Paths.get(args.get("cache", "jdt-client-cache")).toAbsolutePath().normalize();
         DeltaClient.Log log = DeltaClient.Log.STDOUT;
 
-        try (DeltaClient client = new DeltaClient(server, cache, log)
+        javax.net.ssl.SSLContext ssl = com.bw.jdt.proto.Tls.clientContext(
+                pathOrNull(args.get("truststore", null)),
+                com.bw.jdt.proto.Tls.password(args.get("truststore-password", null),
+                        "JDT_TRUSTSTORE_PASSWORD"),
+                pathOrNull(args.get("client-cert", null)),
+                com.bw.jdt.proto.Tls.password(args.get("client-cert-password", null),
+                        "JDT_CLIENT_CERT_PASSWORD"));
+
+        try (DeltaClient client = new DeltaClient(server, cache, ssl, log)
                 .keepBaseCache(args.has("keep-base-cache"))
                 .indexThreads(args.getInt("index-threads",
                         Math.min(8, Runtime.getRuntime().availableProcessors())))
@@ -65,6 +73,18 @@ public final class ClientMain {
                     System.exit(2);
                 }
             }
+        } catch (javax.net.ssl.SSLException e) {
+            // By far the most common TLS mistake is a server certificate the client was never
+            // told to trust. A stack trace buries that; say what to do instead.
+            System.err.println("TLS handshake with " + server + " failed: " + e.getMessage());
+            System.err.println("If the server uses a privately issued or self signed certificate,"
+                    + " export it and pass the truststore holding it:");
+            System.err.println("  keytool -exportcert -alias server -keystore server.p12"
+                    + " -file server.crt");
+            System.err.println("  keytool -importcert -noprompt -alias server -file server.crt"
+                    + " -keystore trust.p12 -storetype PKCS12");
+            System.err.println("  " + "jdt client ... --truststore trust.p12");
+            System.exit(1);
         }
     }
 
@@ -116,6 +136,10 @@ public final class ClientMain {
         System.out.println("  written to         " + out);
     }
 
+    private static Path pathOrNull(String value) {
+        return value == null || value.isBlank() ? null : Paths.get(value);
+    }
+
     private static DeltaClient.RebuildAs parseRebuildAs(String value) {
         try {
             return DeltaClient.RebuildAs.valueOf(value.trim().toUpperCase(Locale.ROOT));
@@ -155,6 +179,14 @@ public final class ClientMain {
                                        (default: min(cores, 8))
                   --rebuild-threads N  nested archives rebuilt in parallel; this is the dominant
                                        cost of a warm transfer (default: min(cores, 8))
+                  --truststore FILE    certificates this client will accept. Needed when the server
+                                       uses a privately issued or self signed certificate; without
+                                       it the JVM's public authorities apply. Pinning one
+                                       certificate this way is stronger than trusting them all.
+                  --truststore-password P        or JDT_TRUSTSTORE_PASSWORD
+                  --client-cert FILE   this client's own certificate, for a server started with
+                                       --tls-require-client-cert
+                  --client-cert-password P       or JDT_CLIENT_CERT_PASSWORD
                   --no-compress        do not ask the server to compress the block stream. Blocks
                                        carry decompressed content, so compression normally pays;
                                        turn it off on a link fast enough that gzip is the

@@ -43,6 +43,18 @@ Both ports take any address the host has, so the admin half can live on a manage
 instead of loopback (`--admin-bind 10.0.99.5`). An address that cannot be resolved or does not
 belong to the host fails at startup, naming which port it was; nothing falls back to the wildcard.
 
+## TLS
+
+Both ports speak HTTPS when the server is started with `--tls-keystore`, and plain HTTP otherwise;
+there is no mixed mode. TLS 1.2 is the floor. Certificate and hostname verification are the JDK
+defaults and cannot be switched off — for a privately issued certificate, point the client at a
+truststore holding it.
+
+TLS encrypts the channel and proves the client reached the intended server. It does **not** limit
+who may ask: with no client certificate required, anyone who can reach the transfer port can
+download every archive. `--tls-require-client-cert` together with `--tls-truststore` is what makes
+the handshake act as access control.
+
 ## Conventions
 
 - All JSON is UTF-8, `Content-Type: application/json; charset=utf-8`, pretty printed.

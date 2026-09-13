@@ -55,13 +55,31 @@ public final class DeltaClient implements Closeable {
     }
 
     public DeltaClient(URI base, Path cacheDir, Log log) {
+        this(base, cacheDir, null, log);
+    }
+
+    /**
+     * @param sslContext trust and, for mutual TLS, the client's own certificate. Null uses the
+     *                   JVM default, which trusts the public certificate authorities -- right for
+     *                   a publicly issued server certificate, not enough for a private one.
+     */
+    public DeltaClient(URI base, Path cacheDir, javax.net.ssl.SSLContext sslContext, Log log) {
         this.base = base;
         this.cacheDir = cacheDir;
         this.log = log;
-        this.http = HttpClient.newBuilder()
+        HttpClient.Builder builder = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(20))
-                .followRedirects(HttpClient.Redirect.NORMAL)
-                .build();
+                .followRedirects(HttpClient.Redirect.NORMAL);
+        if (sslContext != null) {
+            builder.sslContext(sslContext);
+        }
+        // Hostname verification and certificate validation stay at the JDK defaults, which is to
+        // say on. There is no switch here to weaken them.
+        this.http = builder.build();
+        if ("http".equalsIgnoreCase(base.getScheme())) {
+            log.info("warning: " + base + " is unencrypted. Blocks, hashes and archive names "
+                    + "travel in the clear; use https:// against a TLS enabled server.");
+        }
     }
 
     /**

@@ -181,6 +181,60 @@ own small thread pool, so a running rescan cannot eat into the threads serving t
 Keeping the read-only API on both ports is deliberate. It exposes nothing the transfer port does
 not already, and without it the overview page would link to dead addresses.
 
+### TLS
+
+`--tls-keystore` turns on HTTPS on **both** ports — an admin port on a management interface needs
+encryption at least as much as the transfer port. The client follows the URL scheme.
+
+```bash
+# one-off certificate for a host answering to localhost and 127.0.0.1
+keytool -genkeypair -alias server -keyalg RSA -keysize 2048 -validity 365 \
+        -dname "CN=archives.example.internal" \
+        -ext "SAN=dns:archives.example.internal,dns:localhost,ip:127.0.0.1" \
+        -keystore server.p12 -storetype PKCS12 -storepass "$PW" -keypass "$PW"
+
+export JDT_TLS_KEYSTORE_PASSWORD="$PW"
+jdt server --tls-keystore server.p12 --archives data/archives --store data/store
+```
+
+The client needs to trust that certificate. For a privately issued or self signed one, hand it a
+truststore — which pins that single certificate and is **stronger** than trusting every public
+authority:
+
+```bash
+keytool -exportcert -alias server -keystore server.p12 -storepass "$PW" -file server.crt
+keytool -importcert -noprompt -alias server -file server.crt \
+        -keystore trust.p12 -storetype PKCS12 -storepass "$PW"
+
+export JDT_TRUSTSTORE_PASSWORD="$PW"
+jdt client fetch --server https://archives.example.internal:8080 --truststore trust.p12 \
+                 --version archive-v02 --base local/archive-v01.zip --out local/archive-v02.zip
+```
+
+Passwords are read from the environment in preference to the argument, because an argument is
+visible to anyone who can list processes. TLS 1.2 is the floor; nothing older is offered.
+
+**There is no switch to skip certificate or hostname verification.** One gets added in a hurry and
+never removed, and it makes the whole exercise theatre. A private certificate is supported the
+correct way, above.
+
+#### Encryption is not access control
+
+TLS gives a confidential channel and proof the client reached the intended server. It does not
+restrict *who* may ask: without a client certificate, anyone who can reach the transfer port still
+gets every archive. `--tls-require-client-cert` together with `--tls-truststore` is what turns the
+handshake into access control:
+
+```bash
+jdt server --tls-keystore server.p12 --tls-truststore clients.p12 --tls-require-client-cert
+jdt client fetch --server https://... --truststore trust.p12 --client-cert my-client.p12 ...
+```
+
+Getting this right needed care: the JDK applies `HttpsParameters.setSSLParameters(...)` *instead of*
+the individual setters, so calling `params.setNeedClientAuth(true)` alongside it is silently
+ignored — the flag would have looked configured while nothing was demanded. `TlsTest` asserts that
+a client without a certificate is actually turned away, which is how that was caught.
+
 `GET /api/versions` returns, for every version: id, file name, size, `sha256`, the blueprint's
 own `sha256`, block counts and the ingest timestamp.
 
@@ -303,7 +357,10 @@ jdt client hash --file FILE          SHA-256 of a local file
 --threads N           HTTP worker threads                       (default: cores)
 --ingest-threads N    archives decomposed in parallel on scan   (default: cores/2, max 4)
 --max-7z-size SZ      largest nested 7z opened up                (default: 512MiB)
---compress true|false compress the block stream                  (default: true)
+--compress true|false compress the block stream                 (default: true)
+--tls-keystore FILE   server certificate and key; turns on HTTPS on both ports
+--tls-truststore FILE client certificates to accept (mutual TLS)
+--tls-require-client-cert   refuse clients without a certificate|false compress the block stream                  (default: true)
 --compress-level N    gzip level, 0 disables it                  (default: 1)
 --compress true|false compress the block stream                 (default: true)
 --compress-level N    gzip level, 0 disables it                 (default: 1)
@@ -322,6 +379,8 @@ jdt client hash --file FILE          SHA-256 of a local file
 --rebuild-threads N  nested archives and deflated entries rebuilt in parallel (default: min(cores, 8))
 --rebuild-as M       original (default), zip or extract; see "Giving up byte identity"
 --no-compress        do not ask the server to compress the block stream
+--truststore FILE    certificates this client accepts (for a private server certificate)
+--client-cert FILE   this client's own certificate, for a server requiring one
                One sub directory per base version, named by its hash. Nothing prunes it, so
                delete the sub directories of versions you no longer upgrade from.
 --version ID   version to fetch

@@ -6,11 +6,15 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import com.sun.net.httpserver.HttpServer;
+import com.sun.net.httpserver.HttpsConfigurator;
+import com.sun.net.httpserver.HttpsParameters;
+import com.sun.net.httpserver.HttpsServer;
 import com.bw.jdt.core.ByteSource;
 import com.bw.jdt.core.ChunkStore;
 import com.bw.jdt.core.Chunker;
 import com.bw.jdt.core.Hash;
 import com.bw.jdt.core.Hashes;
+import com.bw.jdt.proto.Tls;
 import com.bw.jdt.proto.Wire;
 
 import java.io.BufferedInputStream;
@@ -88,6 +92,8 @@ public final class HttpApi implements AutoCloseable {
     private final ExecutorService adminPool;
     private final ObjectMapper json = new ObjectMapper();
     private final VersionStore.Log log;
+    private final Tls.ServerConfig tls;
+    private final String scheme;
 
     public HttpApi(VersionStore store, String bindHost, int port, int maxBlockSize,
                    int threads, VersionStore.Log log) throws IOException {
@@ -106,7 +112,20 @@ public final class HttpApi implements AutoCloseable {
 
     public HttpApi(VersionStore store, Endpoints endpoints, int maxBlockSize, int threads,
                    int compressionLevel, VersionStore.Log log) throws IOException {
+        this(store, endpoints, maxBlockSize, threads, compressionLevel, null, log);
+    }
+
+    /**
+     * @param tls server certificate and, optionally, the client certificates to accept. When null
+     *            both ports speak plain HTTP; when given, both speak HTTPS -- an admin port on a
+     *            management interface needs encryption at least as much as the transfer port.
+     */
+    public HttpApi(VersionStore store, Endpoints endpoints, int maxBlockSize, int threads,
+                   int compressionLevel, Tls.ServerConfig tls, VersionStore.Log log)
+            throws IOException {
         this.store = store;
+        this.tls = tls;
+        this.scheme = tls == null ? "http" : "https";
         this.maxBlockSize = maxBlockSize;
         this.compressionLevel = compressionLevel;
         this.log = log;
@@ -147,19 +166,45 @@ public final class HttpApi implements AutoCloseable {
      * can act on. Both ports can be given any local address, which is the point when the admin
      * half belongs on a management interface rather than on loopback.
      */
-    private static HttpServer bind(String role, String host, int port, int backlog)
+    private HttpServer bind(String role, String host, int port, int backlog)
             throws IOException {
         InetSocketAddress address = new InetSocketAddress(host, port);
         if (address.isUnresolved()) {
             throw new IOException("cannot resolve the " + role + " bind address '" + host + "'");
         }
         try {
-            return HttpServer.create(address, backlog);
+            if (tls == null) {
+                return HttpServer.create(address, backlog);
+            }
+            HttpsServer https = HttpsServer.create(address, backlog);
+            https.setHttpsConfigurator(configurator());
+            return https;
         } catch (java.net.BindException e) {
             throw new IOException("cannot bind the " + role + " port to " + host + ":" + port
                     + " -- " + e.getMessage()
                     + ". Either the address does not exist on this host or the port is in use.", e);
         }
+    }
+
+    /**
+     * Restricts every connection to TLS 1.2 and 1.3, and demands a client certificate when asked
+     * to. The JDK's default parameters would otherwise decide, and those change between releases.
+     */
+    private HttpsConfigurator configurator() throws IOException {
+        javax.net.ssl.SSLContext ctx = Tls.serverContext(tls);
+        return new HttpsConfigurator(ctx) {
+            @Override
+            public void configure(HttpsParameters params) {
+                javax.net.ssl.SSLParameters p = ctx.getDefaultSSLParameters();
+                p.setProtocols(Tls.PROTOCOLS);
+                // Must go on the SSLParameters object, not on params: once setSSLParameters is
+                // used, the JDK applies only that object and silently ignores
+                // params.setNeedClientAuth. Getting this wrong makes client certificates look
+                // configured while nothing is actually demanded.
+                p.setNeedClientAuth(tls.requireClientCert());
+                params.setSSLParameters(p);
+            }
+        };
     }
 
     private static boolean isWildcard(String host) {
@@ -189,6 +234,11 @@ public final class HttpApi implements AutoCloseable {
 
     public int port() {
         return server.getAddress().getPort();
+    }
+
+    /** "http" or "https", so log lines and the overview page name the right scheme. */
+    public String scheme() {
+        return scheme;
     }
 
     /** @return the admin port, or {@link Endpoints#NO_ADMIN} when it was not opened */
@@ -431,7 +481,7 @@ public final class HttpApi implements AutoCloseable {
         sb.append("<p>JSON: <a href=\"/api/versions\">/api/versions</a>, "
                 + "<a href=\"/api/config\">/api/config</a></p>");
         sb.append("<p>Ingest archives dropped into the archive directory: "
-                + "<code>curl -X POST http://localhost:").append(adminPort())
+                + "<code>curl -X POST ").append(scheme).append("://localhost:").append(adminPort())
                 .append("/api/rescan</code></p>");
         byte[] body = sb.toString().getBytes(StandardCharsets.UTF_8);
         e.getResponseHeaders().add("Content-Type", "text/html; charset=utf-8");

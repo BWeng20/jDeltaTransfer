@@ -2,6 +2,7 @@ package com.bw.jdt.server;
 
 import com.bw.jdt.Args;
 import com.bw.jdt.core.Chunker;
+import com.bw.jdt.proto.Tls;
 import com.bw.jdt.proto.Wire;
 import com.bw.jdt.core.DecomposeLimits;
 
@@ -27,6 +28,11 @@ import java.nio.file.Paths;
  *                       being carried as opaque blocks
  * --compress true|false compress the block stream                  (default: true)
  * --compress-level N    gzip level, 0 disables it                  (default: 1)
+ * --tls-keystore FILE   server certificate and key; turns on HTTPS on both ports
+ * --tls-keystore-password P     better given as JDT_TLS_KEYSTORE_PASSWORD
+ * --tls-truststore FILE         client certificates to accept (mutual TLS)
+ * --tls-truststore-password P   better given as JDT_TLS_TRUSTSTORE_PASSWORD
+ * --tls-require-client-cert     refuse clients without a certificate
  * --verify true|false   rebuild-and-compare after each ingest      (default: true)
  * --force-reindex       discard blocks and blueprints, ingest again
  * --no-scan             do not ingest on startup
@@ -109,11 +115,30 @@ public final class ServerMain {
                 ? HttpApi.Endpoints.NO_ADMIN
                 : args.getInt("admin-port", port + 1);
 
+        Tls.ServerConfig tls = null;
+        String keystore = args.get("tls-keystore", null);
+        if (keystore != null) {
+            char[] ksPw = Tls.password(args.get("tls-keystore-password", null),
+                    "JDT_TLS_KEYSTORE_PASSWORD");
+            String truststore = args.get("tls-truststore", null);
+            tls = new Tls.ServerConfig(
+                    Paths.get(keystore), ksPw,
+                    truststore == null ? null : Paths.get(truststore),
+                    Tls.password(args.get("tls-truststore-password", null),
+                            "JDT_TLS_TRUSTSTORE_PASSWORD"),
+                    args.has("tls-require-client-cert"));
+            log.info("TLS on, " + String.join(" and ", Tls.PROTOCOLS)
+                    + (tls.requireClientCert() ? ", client certificate required" : ""));
+        } else {
+            log.warn("TLS is off: blocks, hashes and archive names travel in the clear."
+                    + " Pass --tls-keystore to encrypt.");
+        }
+
         HttpApi api;
         try {
             api = new HttpApi(store,
                     new HttpApi.Endpoints(bind, port, adminBind, adminPort),
-                    (int) maxBlock, threads, compressionLevel, log);
+                    (int) maxBlock, threads, compressionLevel, tls, log);
         } catch (java.io.IOException e) {
             // A mistyped or unavailable bind address is an operator error, not a crash.
             System.err.println("cannot start: " + e.getMessage());
@@ -122,9 +147,9 @@ public final class ServerMain {
         }
         api.start();
         String host = "0.0.0.0".equals(bind) ? "localhost" : bind;
-        log.info("transfer port  http://" + host + ":" + api.port() + "/api/versions");
+        log.info("transfer port  " + api.scheme() + "://" + host + ":" + api.port() + "/api/versions");
         if (api.adminPort() != HttpApi.Endpoints.NO_ADMIN) {
-            log.info("admin port     http://" + adminBind + ":" + api.adminPort()
+            log.info("admin port     " + api.scheme() + "://" + adminBind + ":" + api.adminPort()
                     + "/  (overview page and /api/rescan)");
         } else {
             log.info("admin port     disabled");
@@ -160,6 +185,19 @@ public final class ServerMain {
                   --compress-level N    gzip level; 0 disables it (default: 1). Level 1 measured
                                         78.9% of the original at 62 MB/s against level 6's 77.2%
                                         at 39 MB/s -- raise it only for text heavy archives.
+                  --tls-keystore FILE   PKCS12 or JKS holding the server certificate and its key.
+                                        Giving it turns on HTTPS on BOTH ports. Exactly one key
+                                        entry; keystore and key password must match.
+                  --tls-keystore-password P
+                                        Prefer the JDT_TLS_KEYSTORE_PASSWORD environment variable:
+                                        a password in an argument is visible to anyone who can
+                                        list processes.
+                  --tls-truststore FILE certificates of clients this server accepts
+                  --tls-truststore-password P    or JDT_TLS_TRUSTSTORE_PASSWORD
+                  --tls-require-client-cert
+                                        refuse clients that present no certificate. TLS alone
+                                        encrypts the channel; this is what makes it access
+                                        control. Needs --tls-truststore.
                   --verify true|false   rebuild and compare after each ingest (default: true)
                   --force-reindex       discard blocks and blueprints and ingest again
                   --no-scan             do not ingest archives on startup
