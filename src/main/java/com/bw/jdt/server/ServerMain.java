@@ -14,8 +14,11 @@ import java.nio.file.Paths;
  * <pre>
  * --archives DIR        directory holding the archive versions   (default: STORE/archives)
  * --store DIR           persistent state: hashes, blueprints, blocks (default: ./jdt-store)
- * --port N              HTTP port                                 (default: 8080)
- * --bind HOST           bind address                              (default: 0.0.0.0)
+ * --port N              transfer port                             (default: 8080)
+ * --bind HOST           transfer bind address                     (default: 0.0.0.0)
+ * --admin-port N        overview page and admin commands          (default: port + 1)
+ * --admin-bind HOST     admin bind address                        (default: 127.0.0.1)
+ * --no-admin            do not open the admin port at all
  * --max-block-size SZ   hard upper bound for any transferred block (default: 4MiB)
  * --avg-block-size SZ   target average block size                 (default: 64KiB)
  * --threads N           HTTP worker threads                       (default: cores)
@@ -99,10 +102,33 @@ public final class ServerMain {
         log.info("transport compression " + (compressionLevel > 0
                 ? "gzip level " + compressionLevel : "off"));
 
-        HttpApi api = new HttpApi(store, bind, port, (int) maxBlock, threads, compressionLevel, log);
+        // The administrative half lives on its own port so a firewall rule can keep it off the
+        // network, and binds to loopback by default so that it is unreachable even without one.
+        String adminBind = args.get("admin-bind", "127.0.0.1");
+        int adminPort = args.has("no-admin")
+                ? HttpApi.Endpoints.NO_ADMIN
+                : args.getInt("admin-port", port + 1);
+
+        HttpApi api;
+        try {
+            api = new HttpApi(store,
+                    new HttpApi.Endpoints(bind, port, adminBind, adminPort),
+                    (int) maxBlock, threads, compressionLevel, log);
+        } catch (java.io.IOException e) {
+            // A mistyped or unavailable bind address is an operator error, not a crash.
+            System.err.println("cannot start: " + e.getMessage());
+            System.exit(1);
+            return;
+        }
         api.start();
-        log.info("listening on http://" + ("0.0.0.0".equals(bind) ? "localhost" : bind) + ":" + api.port() + "/");
-        log.info("version list: http://localhost:" + api.port() + "/api/versions");
+        String host = "0.0.0.0".equals(bind) ? "localhost" : bind;
+        log.info("transfer port  http://" + host + ":" + api.port() + "/api/versions");
+        if (api.adminPort() != HttpApi.Endpoints.NO_ADMIN) {
+            log.info("admin port     http://" + adminBind + ":" + api.adminPort()
+                    + "/  (overview page and /api/rescan)");
+        } else {
+            log.info("admin port     disabled");
+        }
     }
 
     private static void usage() {
@@ -111,8 +137,15 @@ public final class ServerMain {
 
                   --archives DIR        directory holding the archive versions (default: STORE/archives)
                   --store DIR           persistent hashes, blueprints and blocks (default: ./jdt-store)
-                  --port N              HTTP port (default: 8080)
-                  --bind HOST           bind address (default: 0.0.0.0)
+                  --port N              transfer port (default: 8080)
+                  --bind HOST           transfer bind address (default: 0.0.0.0)
+                  --admin-port N        port for the overview page and /api/rescan
+                                        (default: --port + 1)
+                  --admin-bind HOST     admin bind address (default: 127.0.0.1, so the admin half
+                                        is unreachable from elsewhere even without a firewall).
+                                        Any local address works, so the admin port can sit on a
+                                        separate management interface: --admin-bind 10.0.99.5
+                  --no-admin            do not open the admin port at all
                   --max-block-size SZ   hard upper bound for any transferred block (default: 4MiB)
                   --avg-block-size SZ   target average block size (default: 64KiB)
                   --threads N           HTTP worker threads (default: number of cores)

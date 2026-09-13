@@ -125,17 +125,61 @@ because of the framing itself: a tag, a hash and a length per block, plus the tr
 
 ## HTTP API
 
+Two ports. The **transfer port** carries exactly what a client needs:
+
 | method | path | purpose |
 |--------|------|---------|
-| GET  | `/` | human readable version list |
 | GET  | `/api/versions` | **all versions with their SHA-256 hashes** |
 | GET  | `/api/versions/{id}` | one version |
 | GET  | `/api/versions/{id}/blueprint` | rebuild recipe, gzipped |
 | POST | `/api/versions/{id}/blocks` | requested blocks, framed (the delta) |
 | GET  | `/api/versions/{id}/full` | complete archive, framed |
-| GET  | `/api/config` | block size limits the client must honour |
-| POST | `/api/rescan` | ingest archives dropped into the archive directory |
+| GET  | `/api/config` | the block size limit the client must honour — **minimal** |
 | GET  | `/health` | liveness |
+
+The **admin port** serves all of the above plus:
+
+| method | path | purpose |
+|--------|------|---------|
+| GET  | `/` | human readable version list |
+| GET  | `/api/config` | the operator's **full** view: chunker parameters, store statistics, limits |
+| POST | `/api/rescan` | ingest archives dropped into the archive directory |
+
+`/api/config` is the one path that answers differently per port. The client gets two fields, the
+hash algorithm and `maxBlockSize`, which is all the transfer code reads. Everything else in the
+operator's view is either already in the blueprint and in a more authoritative form (chunker
+parameters, the 7z limit — per version, not per current setting), stated by the response headers
+per response (the transport encoding), or operational data about how much the server stores. Each
+shape has its own schema, both with `additionalProperties: false`, so a field leaking from one
+into the other fails `ApiContractTest` rather than production.
+
+```
+--port 8080            transfer port
+--admin-port 8081      default is --port + 1
+--admin-bind 127.0.0.1 loopback by default; any local address works
+--no-admin             do not open it at all
+```
+
+`--admin-bind` takes any address the host actually has, so the admin port can sit on a separate
+management interface rather than on loopback:
+
+```bash
+jdt server --bind 0.0.0.0 --port 8080 --admin-bind 10.0.99.5 --admin-port 9443
+```
+
+A mistyped or unavailable address fails at startup with a message naming which of the two ports
+it was, rather than a stack trace — there is no silent fallback to the wildcard, which would
+quietly undo the whole point. Binding admin to `0.0.0.0` is allowed but logs a warning, because at
+that point only a firewall rule still separates the two halves.
+
+The split exists so a firewall rule can keep the administrative half off the network — and the
+default binding to loopback means it is unreachable from elsewhere even without one. The point is
+that the transfer port does not *refuse* `/api/rescan`, it does not **have** it: an unauthenticated
+endpoint that starts minutes of work has no business being reachable. The admin port also gets its
+own small thread pool, so a running rescan cannot eat into the threads serving transfers.
+
+Keeping the read-only API on both ports is deliberate. It exposes nothing the transfer port does
+not already, and without it the overview page would link to dead addresses.
 
 `GET /api/versions` returns, for every version: id, file name, size, `sha256`, the blueprint's
 own `sha256`, block counts and the ingest timestamp.
@@ -249,8 +293,11 @@ jdt client hash --file FILE          SHA-256 of a local file
 ```
 --archives DIR        directory holding the archive versions   (default: STORE/archives)
 --store DIR           persistent hashes, blueprints and blocks  (default: ./jdt-store)
---port N              HTTP port                                 (default: 8080)
---bind HOST           bind address                              (default: 0.0.0.0)
+--port N              transfer port                             (default: 8080)
+--bind HOST           transfer bind address                     (default: 0.0.0.0)
+--admin-port N        overview page and admin commands          (default: port + 1)
+--admin-bind HOST     admin bind address, any local one         (default: 127.0.0.1)
+--no-admin            do not open the admin port at all
 --max-block-size SZ   hard upper bound for any block            (default: 4MiB)
 --avg-block-size SZ   target average block size                 (default: 64KiB)
 --threads N           HTTP worker threads                       (default: cores)

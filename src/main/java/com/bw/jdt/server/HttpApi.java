@@ -27,27 +27,65 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * HTTP surface of the server.
+ * HTTP surface of the server, split over two ports so the administrative half can be kept off
+ * the network with nothing more than a firewall rule -- or, by default, by never leaving loopback.
+ *
+ * <p>The transfer port carries exactly what a client needs and nothing else:
  *
  * <pre>
- *   GET  /                            human readable version list
  *   GET  /api/config                  block size limits the client has to honour
  *   GET  /api/versions                all versions with their SHA-256 hashes
  *   GET  /api/versions/{id}           one version
  *   GET  /api/versions/{id}/blueprint the rebuild recipe (gzipped)
  *   POST /api/versions/{id}/blocks    requested blocks, framed (the delta)
  *   GET  /api/versions/{id}/full      the complete archive, framed
- *   POST /api/rescan                  ingest newly dropped archives
  *   GET  /health
  * </pre>
+ *
+ * <p>The admin port serves all of the above -- so the overview page's links work and an operator
+ * needs only one address -- plus:
+ *
+ * <pre>
+ *   GET  /                            human readable version list
+ *   POST /api/rescan                  ingest newly dropped archives
+ * </pre>
+ *
+ * <p>Keeping the read API on both is deliberate: it exposes nothing the transfer port does not
+ * already, and without it the overview page would link to dead addresses. What the transfer port
+ * must not carry is {@code /api/rescan}, which is unauthenticated and starts minutes of work.
  */
 public final class HttpApi implements AutoCloseable {
+
+    /**
+     * Where the two servers listen.
+     *
+     * @param bindHost      transfer port bind address
+     * @param port          transfer port, 0 for an ephemeral one
+     * @param adminBindHost admin bind address; loopback by default, so the admin half is
+     *                      unreachable from elsewhere even with no firewall in place
+     * @param adminPort     admin port, 0 for an ephemeral one, or -1 to not open it at all
+     */
+    public record Endpoints(String bindHost, int port, String adminBindHost, int adminPort) {
+
+        public static final int NO_ADMIN = -1;
+
+        /** Transfer port only; nothing administrative is reachable. */
+        public static Endpoints transferOnly(String bindHost, int port) {
+            return new Endpoints(bindHost, port, "127.0.0.1", NO_ADMIN);
+        }
+
+        public boolean adminEnabled() {
+            return adminPort != NO_ADMIN;
+        }
+    }
 
     private final VersionStore store;
     private final int maxBlockSize;
     private final int compressionLevel;
     private final HttpServer server;
+    private final HttpServer adminServer;
     private final ExecutorService pool;
+    private final ExecutorService adminPool;
     private final ObjectMapper json = new ObjectMapper();
     private final VersionStore.Log log;
 
@@ -62,37 +100,132 @@ public final class HttpApi implements AutoCloseable {
      */
     public HttpApi(VersionStore store, String bindHost, int port, int maxBlockSize,
                    int threads, int compressionLevel, VersionStore.Log log) throws IOException {
+        this(store, Endpoints.transferOnly(bindHost, port), maxBlockSize, threads,
+                compressionLevel, log);
+    }
+
+    public HttpApi(VersionStore store, Endpoints endpoints, int maxBlockSize, int threads,
+                   int compressionLevel, VersionStore.Log log) throws IOException {
         this.store = store;
         this.maxBlockSize = maxBlockSize;
         this.compressionLevel = compressionLevel;
         this.log = log;
-        this.server = HttpServer.create(new InetSocketAddress(bindHost, port), 64);
+
+        this.server = bind("transfer", endpoints.bindHost(), endpoints.port(), 64);
         this.pool = Executors.newFixedThreadPool(threads);
         server.setExecutor(pool);
-        server.createContext("/", wrap(this::handleRoot));
-        server.createContext("/health", wrap(e -> sendText(e, 200, "ok\n")));
-        server.createContext("/api/config", wrap(this::handleConfig));
-        server.createContext("/api/versions", wrap(this::handleVersions));
-        server.createContext("/api/rescan", wrap(this::handleRescan));
+        addSharedContexts(server);
+        server.createContext("/api/config", wrap(this::handleClientConfig));
+        // Anything administrative is simply absent here, not merely refused.
+        server.createContext("/", wrap(e -> sendText(e, 404,
+                "not found. This is the transfer port; see /api/versions\n")));
+
+        if (endpoints.adminEnabled()) {
+            if (isWildcard(endpoints.adminBindHost())) {
+                log.warn("the admin port is bound to " + endpoints.adminBindHost()
+                        + ", so it is reachable from every interface. That undoes the reason it is"
+                        + " a separate port; use --admin-bind with a specific address, or make sure"
+                        + " a firewall rule covers it.");
+            }
+            this.adminServer = bind("admin", endpoints.adminBindHost(), endpoints.adminPort(), 16);
+            // Its own small pool: a rescan blocks a thread for minutes and must not eat into the
+            // threads serving transfers.
+            this.adminPool = Executors.newFixedThreadPool(2);
+            adminServer.setExecutor(adminPool);
+            addSharedContexts(adminServer);
+            adminServer.createContext("/api/config", wrap(this::handleAdminConfig));
+            adminServer.createContext("/", wrap(this::handleRoot));
+            adminServer.createContext("/api/rescan", wrap(this::handleRescan));
+        } else {
+            this.adminServer = null;
+            this.adminPool = null;
+        }
+    }
+
+    /**
+     * Binds one of the two servers, turning the JDK's terse failures into something an operator
+     * can act on. Both ports can be given any local address, which is the point when the admin
+     * half belongs on a management interface rather than on loopback.
+     */
+    private static HttpServer bind(String role, String host, int port, int backlog)
+            throws IOException {
+        InetSocketAddress address = new InetSocketAddress(host, port);
+        if (address.isUnresolved()) {
+            throw new IOException("cannot resolve the " + role + " bind address '" + host + "'");
+        }
+        try {
+            return HttpServer.create(address, backlog);
+        } catch (java.net.BindException e) {
+            throw new IOException("cannot bind the " + role + " port to " + host + ":" + port
+                    + " -- " + e.getMessage()
+                    + ". Either the address does not exist on this host or the port is in use.", e);
+        }
+    }
+
+    private static boolean isWildcard(String host) {
+        try {
+            return java.net.InetAddress.getByName(host).isAnyLocalAddress();
+        } catch (java.net.UnknownHostException e) {
+            // Unresolvable hosts are reported by bind() with a better message than a guess here.
+            return false;
+        }
+    }
+
+    /**
+     * Contexts both ports share. {@code /api/config} is deliberately not among them: the two
+     * ports answer it with different documents, and a context cannot be replaced once added.
+     */
+    private void addSharedContexts(HttpServer target) {
+        target.createContext("/health", wrap(e -> sendText(e, 200, "ok\n")));
+        target.createContext("/api/versions", wrap(this::handleVersions));
     }
 
     public void start() {
         server.start();
+        if (adminServer != null) {
+            adminServer.start();
+        }
     }
 
     public int port() {
         return server.getAddress().getPort();
     }
 
+    /** @return the admin port, or {@link Endpoints#NO_ADMIN} when it was not opened */
+    public int adminPort() {
+        return adminServer == null ? Endpoints.NO_ADMIN : adminServer.getAddress().getPort();
+    }
+
     @Override
     public void close() {
         server.stop(0);
         pool.shutdownNow();
+        if (adminServer != null) {
+            adminServer.stop(0);
+            adminPool.shutdownNow();
+        }
     }
 
     // -------------------------------------------------------------- handlers
 
-    private void handleConfig(HttpExchange e) throws IOException {
+    /**
+     * What the transfer port answers: only what a client actually acts on.
+     *
+     * <p>Deliberately not the operator's view. Everything else in the full document is either
+     * something the client already learns from the blueprint (the block size parameters, the
+     * decomposition limit), something the response headers state per response and more
+     * authoritatively (the transport encoding), or plain operational data about how much the
+     * server stores -- which is nobody else's business.
+     */
+    private void handleClientConfig(HttpExchange e) throws IOException {
+        ObjectNode n = json.createObjectNode();
+        n.put("hashAlgorithm", Hashes.ALGORITHM);
+        n.put("maxBlockSize", maxBlockSize);
+        sendJson(e, 200, n);
+    }
+
+    /** The operator's view, on the admin port: everything about this server's configuration. */
+    private void handleAdminConfig(HttpExchange e) throws IOException {
         Chunker.Params p = store.chunkParams();
         ObjectNode n = json.createObjectNode();
         n.put("hashAlgorithm", Hashes.ALGORITHM);
@@ -273,6 +406,10 @@ public final class HttpApi implements AutoCloseable {
                 + "padding:.4rem .6rem;text-align:left}code{font-size:12px}"
                 + "td.h{font-family:ui-monospace,monospace;font-size:11px;word-break:break-all}</style>");
         sb.append("<h1>jDeltaTransfer server</h1>");
+        sb.append("<p><strong>This is the admin port.</strong> It serves this page and ")
+                .append("<code>POST /api/rescan</code> on top of the read only API. Clients use the ")
+                .append("transfer port (").append(port()).append("), which carries neither. Keep ")
+                .append("this port off the network.</p>");
         sb.append("<p>hash algorithm <code>").append(Hashes.ALGORITHM).append("</code>, ")
                 .append("block size min ").append(p.min()).append(" / avg ").append(p.avg())
                 .append(" / max ").append(p.max()).append(" bytes, hard limit ")
@@ -293,6 +430,9 @@ public final class HttpApi implements AutoCloseable {
         sb.append("</table>");
         sb.append("<p>JSON: <a href=\"/api/versions\">/api/versions</a>, "
                 + "<a href=\"/api/config\">/api/config</a></p>");
+        sb.append("<p>Ingest archives dropped into the archive directory: "
+                + "<code>curl -X POST http://localhost:").append(adminPort())
+                .append("/api/rescan</code></p>");
         byte[] body = sb.toString().getBytes(StandardCharsets.UTF_8);
         e.getResponseHeaders().add("Content-Type", "text/html; charset=utf-8");
         e.sendResponseHeaders(200, body.length);

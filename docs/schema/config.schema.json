@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://jdeltatransfer.invalid/schema/config.schema.json",
   "title": "ServerConfig",
-  "description": "Response of GET /api/config: the block size limits a client has to honour, plus block store statistics.",
+  "description": "Response of GET /api/config on the ADMIN port: the operator's full view of this server's configuration, including block store statistics. The transfer port answers the same path with a much shorter document (client-config.schema.json) carrying only what a client acts on.",
   "type": "object",
   "additionalProperties": false,
   "required": [

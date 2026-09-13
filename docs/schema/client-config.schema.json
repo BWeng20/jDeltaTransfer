@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jdeltatransfer.invalid/schema/client-config.schema.json",
+  "title": "ClientConfig",
+  "description": "Response of GET /api/config on the transfer port: the minimum a client needs in order to talk to this server. The admin port answers the same path with the operator's full view (config.schema.json); this one is deliberately short, since everything else is either already in the blueprint, stated per response by the headers, or operational data a client has no business seeing.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["hashAlgorithm", "maxBlockSize"],
+  "properties": {
+    "hashAlgorithm": {
+      "type": "string",
+      "const": "SHA-256",
+      "description": "Algorithm behind the archive hashes and the per block hashes in the framing."
+    },
+    "maxBlockSize": {
+      "type": "integer",
+      "description": "The server's --max-block-size: the hard upper bound for any block on the wire. A client must reject a frame claiming a larger length; that is the one thing it uses this document for.",
+      "minimum": 1024,
+      "examples": [4194304]
+    }
+  }
+}

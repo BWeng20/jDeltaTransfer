@@ -93,7 +93,11 @@ class TransportCompressionTest {
     void aServerWithCompressionOffServesRaw(@TempDir Path tmp) throws Exception {
         Fixture f = serve(tmp, "off", 0);
         try (DeltaClient client = new DeltaClient(f.server(), tmp.resolve("c"), DeltaClient.Log.STDOUT)) {
-            assertEquals("none", client.config().path("transportCompression").asText());
+            // Whether the server compresses is observed from the bytes, not from its config: the
+            // transfer port's config is minimal and does not carry the compression setting, and
+            // the response header is what a client must go by in any case.
+            assertTrue(client.config().at("/transportCompression").isMissingNode(),
+                    "the transfer port must not advertise the server's compression setting");
 
             Path base = tmp.resolve("base.zip");
             client.fetchFull("archive-v01", base);

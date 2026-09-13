@@ -50,17 +50,27 @@ class ApiContractTest {
         VersionStore store = VersionStore.open(storeDir, archives, params, true, false);
         store.scan(VersionStore.Log.STDOUT);
 
-        HttpApi api = new HttpApi(store, "127.0.0.1", 0, 1 << 20, 4, VersionStore.Log.STDOUT);
+        HttpApi api = new HttpApi(store,
+                new HttpApi.Endpoints("127.0.0.1", 0, "127.0.0.1", 0),
+                1 << 20, 4, com.bw.jdt.proto.Wire.DEFAULT_COMPRESSION_LEVEL,
+                VersionStore.Log.STDOUT);
         api.start();
         try (HttpClient http = HttpClient.newHttpClient()) {
             URI base = URI.create("http://127.0.0.1:" + api.port());
+            URI admin = URI.create("http://127.0.0.1:" + api.adminPort());
 
             validate("version-list.schema.json", getJson(http, base.resolve("/api/versions")));
             validate("version.schema.json", getJson(http, base.resolve("/api/versions/archive-v01")));
-            validate("config.schema.json", getJson(http, base.resolve("/api/config")));
 
+            // The same path answers differently per port, so each shape gets its own schema.
+            // additionalProperties:false in both means a field leaking from one into the other
+            // fails here rather than in production.
+            validate("client-config.schema.json", getJson(http, base.resolve("/api/config")));
+            validate("config.schema.json", getJson(http, admin.resolve("/api/config")));
+
+            // Rescan lives on the admin port only; the transfer port does not carry it.
             HttpResponse<String> rescan = http.send(
-                    HttpRequest.newBuilder(base.resolve("/api/rescan")).POST(
+                    HttpRequest.newBuilder(admin.resolve("/api/rescan")).POST(
                             HttpRequest.BodyPublishers.noBody()).build(),
                     HttpResponse.BodyHandlers.ofString());
             assertEquals(200, rescan.statusCode());

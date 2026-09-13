@@ -8,13 +8,40 @@ cannot drift apart silently.
 |----------|--------|
 | `GET /api/versions` | [version-list.schema.json](schema/version-list.schema.json) → [version.schema.json](schema/version.schema.json) |
 | `GET /api/versions/{id}` | [version.schema.json](schema/version.schema.json) |
-| `GET /api/config` | [config.schema.json](schema/config.schema.json) |
+| `GET /api/config` on the transfer port | [client-config.schema.json](schema/client-config.schema.json) |
+| `GET /api/config` on the admin port | [config.schema.json](schema/config.schema.json) |
 | `POST /api/rescan` | [rescan.schema.json](schema/rescan.schema.json) |
 | `STORE/index.json` (on disk) | [store-index.schema.json](schema/store-index.schema.json) |
 
 Everything else the server serves is binary, described under [Binary formats](#binary-formats).
 
 ---
+
+## Two ports
+
+The API is split so the administrative half can be firewalled off, and by default binds to
+loopback so it is unreachable from elsewhere even without a firewall.
+
+| | transfer port (`--port`, default 8080) | admin port (`--admin-port`, default 8081) |
+|--|--|--|
+| `GET /api/versions`, `/api/versions/{id}`, `/blueprint`, `/full` | yes | yes |
+| `POST /api/versions/{id}/blocks` | yes | yes |
+| `GET /health` | yes | yes |
+| `GET /api/config` | yes, **minimal** | yes, **full** |
+| `GET /` (overview page) | **no** — 404 | yes |
+| `POST /api/rescan` | **no** — 404 | yes |
+
+The transfer port does not refuse the administrative endpoints, it does not have them: a 404 there
+is the absence of a route, not a permission check. `--no-admin` leaves the admin port unopened
+altogether, in which case those two endpoints exist nowhere.
+
+`/api/config` is the one path that answers **differently per port**: the transfer port returns only
+what a client acts on, the admin port the operator's full view. Neither reports the admin port
+itself — a client has no use for it, and advertising it would work against the reason for the split.
+
+Both ports take any address the host has, so the admin half can live on a management interface
+instead of loopback (`--admin-bind 10.0.99.5`). An address that cannot be resolved or does not
+belong to the host fails at startup, naming which port it was; nothing falls back to the wildcard.
 
 ## Conventions
 
@@ -86,7 +113,31 @@ One version, exactly the object described above. `404 text/plain` if `id` is unk
 
 ## GET /api/config
 
-The limits a client has to honour, plus block store statistics.
+### On the transfer port — minimal
+
+Only what a client acts on. Schema: [client-config.schema.json](schema/client-config.schema.json).
+
+```json
+{
+  "hashAlgorithm" : "SHA-256",
+  "maxBlockSize" : 4194304
+}
+```
+
+| field | type | meaning |
+|-------|------|---------|
+| `hashAlgorithm` | string | Always `SHA-256`. |
+| `maxBlockSize` | int | The server's `--max-block-size`. **No frame on the wire exceeds it**; a client must reject a larger one. This is the only field the transfer code reads. |
+
+Everything in the operator's document below is left out on purpose. The block size parameters and
+the decomposition limit already travel inside each blueprint, and in the authoritative form —
+per version, not per current server setting. The transport encoding is stated by the response
+headers, per response, which is what a client must go by anyway. And the store statistics are
+operational data a client has no reason to see.
+
+### On the admin port — full
+
+The operator's view. Schema: [config.schema.json](schema/config.schema.json).
 
 ```json
 {
@@ -129,8 +180,9 @@ below the hard limit — with the defaults above, blocks stay at or below 256 Ki
 
 ## POST /api/rescan
 
-Ingests archives that were dropped into the archive directory after startup. Synchronous: the
-response arrives once decomposition has finished, which takes minutes for gigabyte archives.
+**Admin port only.** Ingests archives that were dropped into the archive directory after startup.
+Synchronous: the response arrives once decomposition has finished, which takes minutes for gigabyte
+archives — which is precisely why it is not reachable from the transfer port.
 
 ```json
 { "ingested" : 2, "total" : 12 }
@@ -148,7 +200,8 @@ response arrives once decomposition has finished, which takes minutes for gigaby
 
 ## GET /
 
-An HTML page with the same version list, for looking at in a browser.
+**Admin port only.** An HTML page with the same version list, for looking at in a browser. The
+transfer port answers `404 text/plain` here instead.
 
 ---
 
