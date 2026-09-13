@@ -468,10 +468,12 @@ The repacked output is deliberately **not** the original file and does not carry
 there would be no point pretending otherwise. What still holds is that every byte came from a
 block whose hash was checked on arrival, and that each member was written with exactly the content
 the blueprint describes; `Repacker.verifyEntries` re-reads the output and compares member by
-member. `RepackTest` pins that down by reading the bit exact rebuild and the repack side by side
-and asserting the two agree on every member.
+member. `RepackTest` pins that down for ZIP and 7z on top by reading the bit exact rebuild and the
+repack side by side and asserting they agree on every member. There is no CAB reader here to read
+the reference with, so for a cabinet the two repack shapes are compared against each other.
 
-Three things to know before using it:
+All three container formats can be listed, so `--rebuild-as` works whatever sits on top. Four
+things to know before using it:
 
 - **It costs disk.** Stored entries mean no compression: 151.88 MiB against the original 126.65
   MiB here, and the gap widens the better the original compressed. Re-deflating instead would give
@@ -480,8 +482,9 @@ Three things to know before using it:
   own key instead of handing it over. The next upgrade from the same base still reuses its index.
 - **Nested archives stay whole.** Each is rebuilt bit exactly and written as one member; only the
   outermost container changes shape. Nothing is unpacked recursively.
-- CAB cannot be listed logically yet, so `--rebuild-as` on a top level cabinet falls back to the
-  original format with a log line. The output is correct, just not the requested shape.
+- An outer container that was left **opaque** — a 7z above `--max-7z-size`, say — has no members to
+  work from, so the client falls back to the original format with a log line. The output is
+  correct, just not the requested shape.
 
 ZIP on top with 7z nested inside needs none of this: the outer entries parallelise, and the nested
 7z containers are small enough for their solid streams not to dominate.

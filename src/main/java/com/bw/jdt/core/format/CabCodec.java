@@ -101,6 +101,177 @@ public final class CabCodec implements ContainerCodec {
         }
     }
 
+    /**
+     * Recovers the cabinet's members from the CFFILE table, which the skeleton keeps verbatim.
+     *
+     * <p>The table gives names and the offset of each file inside its folder's payload, but not
+     * which part carries it. That mapping is re-derived by replaying exactly what
+     * {@link #writeFolderSegments} did: files sorted by offset, gaps between them becoming inline
+     * metadata when short and a part when long. If the replay does not line up with the segment
+     * kinds recorded in the metadata, this returns {@code null} rather than guess -- a listing
+     * that quietly mismatched would hand the caller the wrong bytes under the right name.
+     */
+    @Override
+    public List<LogicalEntry> list(byte[] metaBytes) throws IOException {
+        try {
+            DataInputStream meta = new DataInputStream(new java.io.ByteArrayInputStream(metaBytes));
+            byte[] prefix = readBytes(meta);
+            List<CabFile> files = readFileTable(prefix);
+            if (files == null) {
+                return null;
+            }
+
+            List<LogicalEntry> entries = new ArrayList<>();
+            int folderCount = meta.readInt();
+            int partIndex = 0;
+            for (int f = 0; f < folderCount; f++) {
+                meta.readUnsignedByte(); // compress type
+                meta.readUnsignedByte(); // deflate level
+                int blockCount = meta.readInt();
+                long folderSize = 0;
+                for (int b = 0; b < blockCount; b++) {
+                    meta.readInt();                 // cbData
+                    folderSize += meta.readInt();   // cbUncomp
+                    readBytes(meta);                // block header
+                }
+
+                List<Integer> kinds = new ArrayList<>();
+                int segCount = meta.readInt();
+                for (int i = 0; i < segCount; i++) {
+                    int kind = meta.readUnsignedByte();
+                    kinds.add(kind);
+                    if (kind == SEG_INLINE) {
+                        readBytes(meta);
+                    }
+                }
+
+                final int folder = f;
+                List<CabFile> inFolder = new ArrayList<>();
+                for (CabFile file : files) {
+                    if (file.folder == folder) {
+                        inFolder.add(file);
+                    }
+                }
+                inFolder.sort(Comparator.comparingLong(x -> x.offset));
+
+                partIndex = mapFolder(inFolder, folderSize, kinds, partIndex, entries);
+                if (partIndex < 0) {
+                    return null;
+                }
+            }
+            return entries;
+        } catch (IOException | RuntimeException e) {
+            return null;
+        }
+    }
+
+    /**
+     * Walks one folder's recorded segment kinds against the segmentation the file ranges imply.
+     *
+     * @return the part index after this folder, or -1 if the two do not agree
+     */
+    private static int mapFolder(List<CabFile> inFolder, long folderSize, List<Integer> kinds,
+                                 int partIndex, List<LogicalEntry> entries) {
+        // What writeFolderSegments would have produced: (isFile, name, size) in order.
+        List<Object[]> expected = new ArrayList<>();
+        long pos = 0;
+        for (CabFile file : inFolder) {
+            if (file.offset < pos || file.offset + file.size > folderSize) {
+                // decompose collapsed this folder into one opaque segment; no file mapping exists.
+                return -1;
+            }
+            long gap = file.offset - pos;
+            if (gap > 0) {
+                expected.add(new Object[]{Boolean.FALSE, null, gap});
+            }
+            if (file.size > 0) {
+                expected.add(new Object[]{Boolean.TRUE, file.name, file.size});
+            }
+            pos = file.offset + file.size;
+        }
+        if (folderSize - pos > 0) {
+            expected.add(new Object[]{Boolean.FALSE, null, folderSize - pos});
+        }
+        if (expected.size() != kinds.size()) {
+            return -1;
+        }
+
+        int index = partIndex;
+        for (int i = 0; i < expected.size(); i++) {
+            boolean isFile = (Boolean) expected.get(i)[0];
+            long len = (Long) expected.get(i)[2];
+            int wantKind = isFile || len > INLINE_LIMIT ? SEG_PART : SEG_INLINE;
+            if (kinds.get(i) != wantKind) {
+                return -1;
+            }
+            if (kinds.get(i) == SEG_PART) {
+                if (isFile) {
+                    entries.add(new LogicalEntry(((String) expected.get(i)[1]).replace('\\', '/'),
+                            len, index));
+                }
+                index++;
+            }
+        }
+        return index;
+    }
+
+    /** One row of the CFFILE table. */
+    private static final class CabFile {
+        String name;
+        long offset;
+        long size;
+        int folder;
+    }
+
+    /** @return the CFFILE table, or {@code null} if the header prefix does not parse */
+    private static List<CabFile> readFileTable(byte[] prefix) {
+        if (prefix.length < 36) {
+            return null;
+        }
+        ByteBuffer h = ByteBuffer.wrap(prefix).order(ByteOrder.LITTLE_ENDIAN);
+        if (h.getInt(0) != SIG) {
+            return null;
+        }
+        long coffFiles = u32(h, 16);
+        int folderCount = u16(h, 26);
+        int fileCount = u16(h, 28);
+        if (coffFiles < 36 || coffFiles > prefix.length || fileCount < 0) {
+            return null;
+        }
+
+        List<CabFile> files = new ArrayList<>(fileCount);
+        int p = (int) coffFiles;
+        for (int i = 0; i < fileCount; i++) {
+            if (p + 16 > prefix.length) {
+                return null;
+            }
+            CabFile file = new CabFile();
+            file.size = u32(h, p);
+            file.offset = u32(h, p + 4);
+            file.folder = u16(h, p + 8);
+            int attribs = u16(h, p + 14);
+            int nameStart = p + 16;
+            int end = nameStart;
+            while (end < prefix.length && prefix[end] != 0) {
+                end++;
+            }
+            if (end >= prefix.length) {
+                return null;
+            }
+            // _A_NAME_IS_UTF marks the name as UTF-8; otherwise the cabinet spec says ASCII.
+            java.nio.charset.Charset cs = (attribs & 0x80) != 0
+                    ? java.nio.charset.StandardCharsets.UTF_8
+                    : java.nio.charset.StandardCharsets.ISO_8859_1;
+            file.name = new String(prefix, nameStart, end - nameStart, cs);
+            // parse() ignores files pointing outside the folder table, so do the same here.
+            if (file.folder < folderCount) {
+                files.add(file);
+            }
+            p = end + 1;
+        }
+        return files;
+    }
+
     @Override
     public void rebuild(byte[] metaBytes, List<ByteSource> parts, OutputStream out, int threads)
             throws IOException {

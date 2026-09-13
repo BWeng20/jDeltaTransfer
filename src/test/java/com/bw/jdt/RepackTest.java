@@ -183,30 +183,86 @@ class RepackTest {
         }
     }
 
-    /** An archive whose outer container is opaque has no members, so a repack must degrade. */
-    @ParameterizedTest(name = "{0}")
-    @ValueSource(strings = {"cab"})
-    void anUnlistableContainerFallsBackToTheOriginalFormat(String outerFormat, @TempDir Path tmp)
-            throws Exception {
-        Fixture f = serve(tmp, outerFormat, 2);
+    /**
+     * A cabinet on top can be listed, but there is no CAB reader here to read the reference
+     * archive with. Instead the two independent write paths are compared against each other:
+     * both derive their members from the blueprint, and the client has already checked each of
+     * them against it, so agreeing on every member is a real check that the mapping is right.
+     */
+    @org.junit.jupiter.api.Test
+    void repackingACabinetYieldsTheSameMembersEitherWay(@TempDir Path tmp) throws Exception {
+        Fixture f = serve(tmp, "cab", 2);
         try (DeltaClient plain = new DeltaClient(f.server(), tmp.resolve("c1"), DeltaClient.Log.STDOUT);
-             DeltaClient repacking = new DeltaClient(f.server(), tmp.resolve("c2"), DeltaClient.Log.STDOUT)
+             DeltaClient asZip = new DeltaClient(f.server(), tmp.resolve("c2"), DeltaClient.Log.STDOUT)
+                     .rebuildAs(DeltaClient.RebuildAs.ZIP);
+             DeltaClient asTree = new DeltaClient(f.server(), tmp.resolve("c3"), DeltaClient.Log.STDOUT)
+                     .rebuildAs(DeltaClient.RebuildAs.EXTRACT)) {
+
+            Path base = tmp.resolve("base.cab");
+            plain.fetchFull("archive-v01", base);
+
+            Path zip = tmp.resolve("out.zip");
+            asZip.fetchDelta("archive-v02", base, zip);
+            assertTrue(isZip(zip), "a listable cabinet must be repacked, not fall back");
+
+            Path tree = tmp.resolve("tree");
+            asTree.fetchDelta("archive-v02", base, tree);
+
+            Map<String, String> fromZip = membersOf(zip);
+            Map<String, String> fromTree = new HashMap<>();
+            try (var walk = Files.walk(tree)) {
+                for (Path p : walk.filter(Files::isRegularFile).toList()) {
+                    fromTree.put(tree.relativize(p).toString().replace('\\', '/'),
+                            Hashes.ofFile(p).hex());
+                }
+            }
+            assertEquals(fromZip, fromTree, "both repack shapes must carry the same members");
+            assertTrue(fromZip.containsKey("manifest.txt"), "members were: " + fromZip.keySet());
+            assertTrue(fromZip.keySet().stream().anyMatch(n -> n.startsWith("nested/")));
+            assertTrue(fromZip.size() > 50, "expected many members, got " + fromZip.size());
+        } finally {
+            f.api().close();
+            f.store().close();
+        }
+    }
+
+    /**
+     * An outer container that was left opaque has no members at all, so a repack has nothing to
+     * work from and must degrade to the original format instead of failing. Forced here by giving
+     * the server a 7z limit below the archive's own size.
+     */
+    @org.junit.jupiter.api.Test
+    void anOpaqueOuterContainerFallsBackToTheOriginalFormat(@TempDir Path tmp) throws Exception {
+        Path archives = tmp.resolve("archives");
+        GenerateTestArchives.main(new String[]{
+                "--out", archives.toString(), "--count", "2", "--start-size", "12MB",
+                "--growth", "0.1", "--threads", "2", "--outer-format", "7z"});
+
+        VersionStore store = VersionStore.open(tmp.resolve("store"), archives,
+                Chunker.Params.of(32768, MAX_BLOCK), true, false);
+        store.setLimits(new com.bw.jdt.core.DecomposeLimits(1024));
+        store.scan(VersionStore.Log.STDOUT);
+        assertTrue(store.version("archive-v01").opaqueContainers() > 0,
+                "the 7z limit should have forced the outer container to stay opaque");
+
+        HttpApi api = new HttpApi(store, "127.0.0.1", 0, MAX_BLOCK, 4, VersionStore.Log.STDOUT);
+        api.start();
+        URI server = URI.create("http://127.0.0.1:" + api.port());
+        try (DeltaClient plain = new DeltaClient(server, tmp.resolve("c1"), DeltaClient.Log.STDOUT);
+             DeltaClient repacking = new DeltaClient(server, tmp.resolve("c2"), DeltaClient.Log.STDOUT)
                      .rebuildAs(DeltaClient.RebuildAs.ZIP)) {
 
-            Path base = tmp.resolve("base." + outerFormat);
+            Path base = tmp.resolve("base.7z");
             plain.fetchFull("archive-v01", base);
 
             Path out = tmp.resolve("out.bin");
             repacking.fetchDelta("archive-v02", base, out);
 
-            // CAB cannot be listed logically yet, so the client produced the original instead --
-            // correct output, just not the requested shape.
-            assertEquals(Hashes.ofFile(f.archives().resolve("archive-v02." + outerFormat)),
-                    Hashes.ofFile(out));
-            assertFalse(isZip(out), "the fallback must be the original cabinet, not a ZIP");
+            assertEquals(Hashes.ofFile(archives.resolve("archive-v02.7z")), Hashes.ofFile(out));
+            assertFalse(isZip(out), "the fallback must be the original 7z, not a ZIP");
         } finally {
-            f.api().close();
-            f.store().close();
+            api.close();
+            store.close();
         }
     }
 
