@@ -82,6 +82,45 @@ end   := 0x00 | frameCount:int64 | totalBytes:int64
 The receiver verifies every block against its announced hash on arrival, and the trailer
 distinguishes a complete transfer from a truncated one.
 
+### Transport compression
+
+Blocks carry **decompressed** content — that is what makes deduplication work, and it means an
+uncompressed stream puts more bytes on the wire than the archive's own compressed growth. For
+v01 → v02 the archive grows by 160.4 MiB while the raw block stream is 197 MiB.
+
+So the framed stream is gzipped, negotiated with the ordinary `Accept-Encoding` /
+`Content-Encoding` headers. The per block hashes are over the *uncompressed* payload, so nothing
+about verification changes, and a peer that does not know about it simply gets a raw stream.
+
+Measured on the 1 GiB chain, same 196.91 MiB of block content either way:
+
+| | uncompressed | gzip level 1 |
+|--|--------------|--------------|
+| on the wire | 197.01 MiB | **171.29 MiB** |
+| versus the full archive | 83.24% saved | **85.43% saved** |
+| download phase | 1.1 s | 4.5 s |
+
+**13.1% fewer bytes for about 3.4 s of CPU per 197 MiB.** That works out to a break-even link
+speed near **63 Mbit/s**: below it, compression wins on wall clock too; above it, it costs time
+and only saves volume — which is still the right trade on a metered link. `--no-compress` on the
+client and `--compress false` on the server turn it off.
+
+Level 1 is the default because the ratio barely improves above it while the throughput falls off:
+
+| gzip level | of the original | throughput |
+|------------|-----------------|------------|
+| 1 | 78.9% | 62.1 MB/s |
+| 6 | 77.2% | 39.3 MB/s |
+| 9 | 77.1% | 31.5 MB/s |
+
+Those are measured on this project's block store, which is deliberately 70% incompressible noise.
+Real archives with text and code compress far better, and there the higher levels start to earn
+their keep — `--compress-level` exists for that.
+
+The uncompressed wire figure is slightly above the block content (197.01 against 196.91 MiB)
+because of the framing itself: a tag, a hash and a length per block, plus the trailer.
+`TransportCompressionTest` asserts that overhead exactly rather than approximately.
+
 ---
 
 ## HTTP API
@@ -217,6 +256,10 @@ jdt client hash --file FILE          SHA-256 of a local file
 --threads N           HTTP worker threads                       (default: cores)
 --ingest-threads N    archives decomposed in parallel on scan   (default: cores/2, max 4)
 --max-7z-size SZ      largest nested 7z opened up                (default: 512MiB)
+--compress true|false compress the block stream                  (default: true)
+--compress-level N    gzip level, 0 disables it                  (default: 1)
+--compress true|false compress the block stream                 (default: true)
+--compress-level N    gzip level, 0 disables it                 (default: 1)
 --verify true|false   rebuild and compare after each ingest     (default: true)
 --force-reindex       discard blocks and blueprints, ingest again
 --no-scan             do not ingest on startup
@@ -231,6 +274,7 @@ jdt client hash --file FILE          SHA-256 of a local file
 --index-threads N  entries decomposed in parallel while indexing the base (default: min(cores, 8))
 --rebuild-threads N  nested archives and deflated entries rebuilt in parallel (default: min(cores, 8))
 --rebuild-as M       original (default), zip or extract; see "Giving up byte identity"
+--no-compress        do not ask the server to compress the block stream
                One sub directory per base version, named by its hash. Nothing prunes it, so
                delete the sub directories of versions you no longer upgrade from.
 --version ID   version to fetch

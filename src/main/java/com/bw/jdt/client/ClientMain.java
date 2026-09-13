@@ -52,7 +52,8 @@ public final class ClientMain {
                         Math.min(8, Runtime.getRuntime().availableProcessors())))
                 .rebuildThreads(args.getInt("rebuild-threads",
                         Math.min(8, Runtime.getRuntime().availableProcessors())))
-                .rebuildAs(parseRebuildAs(args.get("rebuild-as", "original")))) {
+                .rebuildAs(parseRebuildAs(args.get("rebuild-as", "original")))
+                .acceptCompression(!args.has("no-compress"))) {
             switch (command) {
                 case "list" -> printList(client.listVersions());
                 case "info" -> System.out.println(client.versionInfo(args.require("version")).toPrettyString());
@@ -103,6 +104,11 @@ public final class ClientMain {
         }
         System.out.println("  transferred        " + Fmt.human(r.transferredBytes())
                 + "  (" + Fmt.percent(r.savedFraction()) + " less than the full archive)");
+        if (r.wireBytes() != r.blockBytes()) {
+            System.out.println("  on the wire        " + Fmt.human(r.wireTotalBytes())
+                    + "  (" + Fmt.percent(r.wireSavedFraction()) + " less; blocks compressed to "
+                    + Fmt.percent(r.compressionRatio()) + ")");
+        }
         System.out.println("  elapsed            " + Fmt.seconds(elapsed));
         if (r.delta()) {
             System.out.println("  phases             " + r.phases().describe());
@@ -149,6 +155,10 @@ public final class ClientMain {
                                        (default: min(cores, 8))
                   --rebuild-threads N  nested archives rebuilt in parallel; this is the dominant
                                        cost of a warm transfer (default: min(cores, 8))
+                  --no-compress        do not ask the server to compress the block stream. Blocks
+                                       carry decompressed content, so compression normally pays;
+                                       turn it off on a link fast enough that gzip is the
+                                       bottleneck (measured: 62 MB/s at the default level).
                   --rebuild-as M       original (default), zip or extract. Only "original"
                                        reproduces the archive byte for byte and can be checked
                                        against the published SHA-256. The other two write the same

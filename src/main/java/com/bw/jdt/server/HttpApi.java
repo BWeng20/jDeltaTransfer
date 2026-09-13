@@ -45,6 +45,7 @@ public final class HttpApi implements AutoCloseable {
 
     private final VersionStore store;
     private final int maxBlockSize;
+    private final int compressionLevel;
     private final HttpServer server;
     private final ExecutorService pool;
     private final ObjectMapper json = new ObjectMapper();
@@ -52,8 +53,18 @@ public final class HttpApi implements AutoCloseable {
 
     public HttpApi(VersionStore store, String bindHost, int port, int maxBlockSize,
                    int threads, VersionStore.Log log) throws IOException {
+        this(store, bindHost, port, maxBlockSize, threads, Wire.DEFAULT_COMPRESSION_LEVEL, log);
+    }
+
+    /**
+     * @param compressionLevel gzip level for the block stream, or 0 to always serve it
+     *                         uncompressed even when the client offers to accept compression
+     */
+    public HttpApi(VersionStore store, String bindHost, int port, int maxBlockSize,
+                   int threads, int compressionLevel, VersionStore.Log log) throws IOException {
         this.store = store;
         this.maxBlockSize = maxBlockSize;
+        this.compressionLevel = compressionLevel;
         this.log = log;
         this.server = HttpServer.create(new InetSocketAddress(bindHost, port), 64);
         this.pool = Executors.newFixedThreadPool(threads);
@@ -92,6 +103,8 @@ public final class HttpApi implements AutoCloseable {
         n.put("storedBlocks", store.blocks().chunkCount());
         n.put("storedBlockBytes", store.blocks().storedBytes());
         n.put("maxSevenZDecomposeSize", store.limits().maxSevenZBytes());
+        n.put("transportCompression", compressionLevel > 0 ? Wire.ENCODING_GZIP : "none");
+        n.put("transportCompressionLevel", compressionLevel);
         sendJson(e, 200, n);
     }
 
@@ -157,13 +170,17 @@ public final class HttpApi implements AutoCloseable {
             wanted = Wire.readHashList(in);
         }
         ChunkStore blocks = store.blocks();
+        boolean gzip = useGzip(e);
         e.getResponseHeaders().add("Content-Type", Wire.CONTENT_TYPE_BLOCKS);
         e.getResponseHeaders().add("X-JDT-Max-Block-Size", Integer.toString(maxBlockSize));
+        if (gzip) {
+            e.getResponseHeaders().add("Content-Encoding", Wire.ENCODING_GZIP);
+        }
         e.sendResponseHeaders(200, 0);
         long sent;
         try (OutputStream raw = e.getResponseBody();
-             Wire.BlockWriter writer = new Wire.BlockWriter(new java.io.BufferedOutputStream(raw, 1 << 16),
-                     maxBlockSize)) {
+             OutputStream body = wrapForTransport(raw, gzip);
+             Wire.BlockWriter writer = new Wire.BlockWriter(body, maxBlockSize)) {
             for (Hash h : wanted) {
                 if (!blocks.contains(h)) {
                     // The blueprint the client holds and the store disagree; abort loudly.
@@ -173,22 +190,38 @@ public final class HttpApi implements AutoCloseable {
             }
             sent = writer.bytes();
         }
-        log.info("served " + wanted.size() + " blocks (" + VersionStore.human(sent) + ") of " + info.id());
+        log.info("served " + wanted.size() + " blocks (" + VersionStore.human(sent)
+                + (gzip ? ", gzip" : ", uncompressed") + ") of " + info.id());
+    }
+
+    /** Compression happens only when the client asks for it and the server was not told to skip it. */
+    private boolean useGzip(HttpExchange e) {
+        return compressionLevel > 0
+                && Wire.acceptsGzip(e.getRequestHeaders().getFirst("Accept-Encoding"));
+    }
+
+    private OutputStream wrapForTransport(OutputStream raw, boolean gzip) throws IOException {
+        OutputStream buffered = new java.io.BufferedOutputStream(raw, 1 << 16);
+        return gzip ? Wire.gzip(buffered, compressionLevel) : buffered;
     }
 
     /** Streams the full archive as framed blocks, cut by the same content defined chunker. */
     private void handleFull(HttpExchange e, VersionStore.VersionInfo info) throws IOException {
         Path file = store.archiveFile(info.id());
+        boolean gzip = useGzip(e);
         e.getResponseHeaders().add("Content-Type", Wire.CONTENT_TYPE_BLOCKS);
         e.getResponseHeaders().add("X-JDT-Archive-SHA256", info.sha256());
         e.getResponseHeaders().add("X-JDT-Archive-Size", Long.toString(info.size()));
         e.getResponseHeaders().add("X-JDT-Max-Block-Size", Integer.toString(maxBlockSize));
+        if (gzip) {
+            e.getResponseHeaders().add("Content-Encoding", Wire.ENCODING_GZIP);
+        }
         e.sendResponseHeaders(200, 0);
 
         Chunker chunker = new Chunker(store.chunkParams());
         try (OutputStream raw = e.getResponseBody();
-             Wire.BlockWriter writer = new Wire.BlockWriter(new java.io.BufferedOutputStream(raw, 1 << 16),
-                     maxBlockSize);
+             OutputStream body = wrapForTransport(raw, gzip);
+             Wire.BlockWriter writer = new Wire.BlockWriter(body, maxBlockSize);
              OutputStream chunked = chunker.newOutputStream(
                      (buf, off, len) -> writer.write(Hashes.of(buf, off, len), buf, off, len))) {
             if (file != null && Files.exists(file)) {

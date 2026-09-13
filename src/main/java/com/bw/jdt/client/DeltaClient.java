@@ -46,6 +46,7 @@ public final class DeltaClient implements Closeable {
     private int indexThreads = Math.min(8, Runtime.getRuntime().availableProcessors());
     private int rebuildThreads = Math.min(8, Runtime.getRuntime().availableProcessors());
     private RebuildAs rebuildAs = RebuildAs.ORIGINAL;
+    private boolean acceptCompression = true;
 
     public interface Log {
         void info(String message);
@@ -85,6 +86,16 @@ public final class DeltaClient implements Closeable {
         return this;
     }
 
+    /**
+     * Ask the server to compress the block stream. On by default: blocks carry decompressed
+     * content, so an uncompressed stream puts more bytes on the wire than the archive grew by.
+     * Turn it off on a link fast enough that gzip becomes the bottleneck.
+     */
+    public DeltaClient acceptCompression(boolean accept) {
+        this.acceptCompression = accept;
+        return this;
+    }
+
     /** Nested archives rebuilt in parallel. This is the dominant cost of a warm transfer. */
     public DeltaClient rebuildThreads(int threads) {
         this.rebuildThreads = Math.max(1, threads);
@@ -116,14 +127,30 @@ public final class DeltaClient implements Closeable {
             long blocksRequested,
             long blocksReused,
             boolean delta,
+            long wireBytes,
             Phases phases) {
 
+        /** Block content plus blueprint, before transport compression. */
         public long transferredBytes() {
             return blueprintBytes + blockBytes;
         }
 
+        /** What actually crossed the network: compressed blocks plus the blueprint. */
+        public long wireTotalBytes() {
+            return blueprintBytes + wireBytes;
+        }
+
         public double savedFraction() {
             return archiveSize == 0 ? 0 : 1.0 - (double) transferredBytes() / archiveSize;
+        }
+
+        public double wireSavedFraction() {
+            return archiveSize == 0 ? 0 : 1.0 - (double) wireTotalBytes() / archiveSize;
+        }
+
+        /** Ratio of compressed to uncompressed block bytes, or 1 when nothing was compressed. */
+        public double compressionRatio() {
+            return blockBytes == 0 ? 1 : (double) wireBytes / blockBytes;
         }
     }
 
@@ -173,15 +200,24 @@ public final class DeltaClient implements Closeable {
         Path tmp = tempNextTo(out);
         long[] blocks = {0};
         long received;
-        HttpResponse<InputStream> resp = send(HttpRequest.newBuilder(base.resolve("/api/versions/" + id + "/full"))
-                .GET().build());
-        try (InputStream in = resp.body();
+        long wireBytes;
+        HttpRequest.Builder req = HttpRequest.newBuilder(
+                base.resolve("/api/versions/" + id + "/full")).GET();
+        if (acceptCompression) {
+            req.header("Accept-Encoding", Wire.ENCODING_GZIP);
+        }
+        HttpResponse<InputStream> resp = send(req.build());
+        try (InputStream raw = resp.body();
              OutputStream os = new BufferedOutputStream(Files.newOutputStream(tmp), 1 << 20)) {
             requireOk(resp);
-            received = Wire.readBlocks(in, maxBlock, (hash, payload) -> {
-                os.write(payload);
-                blocks[0]++;
-            });
+            Wire.CountingInputStream wire = new Wire.CountingInputStream(raw);
+            try (InputStream in = decode(wire, resp)) {
+                received = Wire.readBlocks(in, maxBlock, (hash, payload) -> {
+                    os.write(payload);
+                    blocks[0]++;
+                });
+            }
+            wireBytes = wire.count();
         }
         Hash actual = Hashes.ofFile(tmp);
         if (!actual.equals(expected)) {
@@ -189,7 +225,7 @@ public final class DeltaClient implements Closeable {
             throw new IOException("full download hash mismatch: expected " + expected + ", got " + actual);
         }
         Files.move(tmp, out, StandardCopyOption.REPLACE_EXISTING);
-        return new TransferResult(id, size, actual, 0, received, blocks[0], 0, false,
+        return new TransferResult(id, size, actual, 0, received, blocks[0], 0, false, wireBytes,
                 new Phases(0, System.nanoTime() - tFull, 0));
     }
 
@@ -255,7 +291,10 @@ public final class DeltaClient implements Closeable {
                     + " blocks from the server (" + reused + " reused locally)");
 
             long tDownload = System.nanoTime();
-            long blockBytes = missing.isEmpty() ? 0 : downloadBlocks(id, missing, maxBlock, incoming);
+            Received received = missing.isEmpty()
+                    ? new Received(0, 0)
+                    : downloadBlocks(id, missing, maxBlock, incoming);
+            long blockBytes = received.contentBytes();
             incoming.sync();
             long downloadNanos = System.nanoTime() - tDownload;
 
@@ -282,7 +321,7 @@ public final class DeltaClient implements Closeable {
             Phases phases = new Phases(indexNanos, downloadNanos, rebuildNanos);
             log.info("phases: " + phases.describe());
             result = new TransferResult(id, size, expected, bpBytes.length, blockBytes,
-                    missing.size(), reused, true, phases);
+                    missing.size(), reused, true, received.wireBytes(), phases);
         } finally {
             deleteRecursively(incomingDir);
         }
@@ -353,19 +392,42 @@ public final class DeltaClient implements Closeable {
         }
     }
 
-    private long downloadBlocks(String id, List<Hash> missing, int maxBlock, ChunkStore into)
+    /** @return content bytes received, and separately what actually crossed the wire */
+    private Received downloadBlocks(String id, List<Hash> missing, int maxBlock, ChunkStore into)
             throws IOException, InterruptedException {
         ByteArrayOutputStream body = new ByteArrayOutputStream(missing.size() * 32 + 16);
         Wire.writeHashList(missing, body);
-        HttpResponse<InputStream> resp = send(HttpRequest.newBuilder(
+        HttpRequest.Builder req = HttpRequest.newBuilder(
                         base.resolve("/api/versions/" + id + "/blocks"))
                 .header("Content-Type", Wire.CONTENT_TYPE_HASHES)
-                .POST(HttpRequest.BodyPublishers.ofByteArray(body.toByteArray()))
-                .build());
-        try (InputStream in = resp.body()) {
-            requireOk(resp);
-            return Wire.readBlocks(in, maxBlock, into::put);
+                .POST(HttpRequest.BodyPublishers.ofByteArray(body.toByteArray()));
+        if (acceptCompression) {
+            req.header("Accept-Encoding", Wire.ENCODING_GZIP);
         }
+        HttpResponse<InputStream> resp = send(req.build());
+        try (InputStream raw = resp.body()) {
+            requireOk(resp);
+            Wire.CountingInputStream wire = new Wire.CountingInputStream(raw);
+            try (InputStream in = decode(wire, resp)) {
+                long content = Wire.readBlocks(in, maxBlock, into::put);
+                return new Received(content, wire.count());
+            }
+        }
+    }
+
+    private record Received(long contentBytes, long wireBytes) {
+    }
+
+    /**
+     * Undoes the transport encoding the server announced. Java's HttpClient does not decompress
+     * on its own, which is convenient here: it lets the wire bytes be counted before decoding.
+     */
+    private static InputStream decode(InputStream in, HttpResponse<?> resp) throws IOException {
+        String encoding = resp.headers().firstValue("Content-Encoding").orElse("");
+        if (Wire.ENCODING_GZIP.equalsIgnoreCase(encoding.trim())) {
+            return new java.util.zip.GZIPInputStream(in, 1 << 16);
+        }
+        return in;
     }
 
     // --------------------------------------------------------------- helpers

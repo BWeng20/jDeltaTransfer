@@ -13,7 +13,9 @@
     "blockSizeMax",
     "storedBlocks",
     "storedBlockBytes",
-    "maxSevenZDecomposeSize"
+    "maxSevenZDecomposeSize",
+    "transportCompression",
+    "transportCompressionLevel"
   ],
   "properties": {
     "hashAlgorithm": {
@@ -51,6 +53,17 @@
       "type": "integer",
       "description": "Total payload bytes in the block store. Smaller than the sum of all archive sizes because versions share blocks.",
       "minimum": 0
+    },
+    "transportCompression": {
+      "type": "string",
+      "enum": ["gzip", "none"],
+      "description": "Whether this server will compress the block stream for a client that sends Accept-Encoding: gzip. Blocks carry decompressed content, so an uncompressed stream puts more bytes on the wire than the archive's own compressed growth."
+    },
+    "transportCompressionLevel": {
+      "type": "integer",
+      "description": "The gzip level used, or 0 when compression is off. Level 1 is the default: measured at 78.9% of the original at 62 MB/s against level 6's 77.2% at 39 MB/s.",
+      "minimum": 0,
+      "examples": [1]
     },
     "maxSevenZDecomposeSize": {
       "type": "integer",

@@ -97,7 +97,9 @@ The limits a client has to honour, plus block store statistics.
   "blockSizeMax" : 262144,
   "storedBlocks" : 74508,
   "storedBlockBytes" : 5491555168,
-  "maxSevenZDecomposeSize" : 536870912
+  "maxSevenZDecomposeSize" : 536870912,
+  "transportCompression" : "gzip",
+  "transportCompressionLevel" : 1
 }
 ```
 
@@ -110,6 +112,8 @@ The limits a client has to honour, plus block store statistics.
 | `storedBlocks` | int64 | Distinct blocks across all versions. |
 | `storedBlockBytes` | int64 | Payload bytes in the block store. Far below the sum of all archive sizes, because versions share blocks. |
 | `maxSevenZDecomposeSize` | int64 | The server's `--max-7z-size`: largest nested 7z opened up rather than carried as opaque blocks. **Informational only** — see below. |
+| `transportCompression` | string | `gzip` if the server will compress the block stream for a client that asks for it, else `none`. |
+| `transportCompressionLevel` | int | The gzip level in use, or 0 when compression is off. |
 
 `maxSevenZDecomposeSize` is reported for operators, not for clients to act on. The authoritative
 value for a given version travels inside that version's blueprint, because the client must
@@ -206,6 +210,13 @@ The complete archive as a block stream, cut by the same content defined chunker.
 ### Block stream
 
 Used by both `/blocks` and `/full`. `Content-Type: application/x-jdt-blocks`.
+
+Send `Accept-Encoding: gzip` to get the stream compressed; the server answers with
+`Content-Encoding: gzip` when it did so, and with no such header when it did not — either because
+the request did not ask or because the server was started with `--compress false`. Check the
+header, do not assume. The frame hashes are over the **uncompressed** payload, so decompress
+first and then parse frames exactly as below. `/api/config` reports whether the server offers it
+at all.
 
 ```
 frame := 0x01 | sha256[32] | length:int32 | payload[length]
