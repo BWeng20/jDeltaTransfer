@@ -54,8 +54,22 @@ container is only taken apart if it can provably be put back together:
 | 7z     | headers cannot be reconstructed from first principles, so the codec does a real round trip: it rebuilds the container and compares the SHA-256 with the original. Only an exact match is accepted. |
 
 Anything that fails becomes an **opaque blob** — still chunked, still transferable, just with less
-delta benefit. Correctness is never traded away. The server additionally rebuilds every archive
-once after ingest and compares the hash (`--verify`, on by default).
+delta benefit. Correctness is never traded away.
+
+The server additionally rebuilds every archive once after ingest and compares the hash
+(`--verify`, on by default). Indexing does not need this; it is a check of the result. The checks
+above are all local — one deflate stream, one CAB block, one 7z container. Nothing during
+decomposition proves that the blueprint *as a whole* is right: headers and offsets across nested
+containers, the order of the block references, and whether every referenced block can actually
+be read back from the store. So the server rebuilds the archive from the new blueprint and its
+own block store into a null stream and compares the SHA-256 with the original file. On a
+mismatch the ingest fails: no blueprint is written and the version is never published.
+
+Without the check, such a fault would surface only on the clients — every transfer of that
+version would end in a failed hash check, and no client can repair it. The rebuild moves that
+failure to the one place that can act on it, once per version. It costs what a client rebuild
+costs, including re-encoding nested 7z archives (see `--max-7z-size` below). `--verify false`
+skips it: clients still verify every result, so a fault is still caught, only later.
 
 ---
 
@@ -306,12 +320,47 @@ the way successive releases of a real product behave.
 jdt server --archives data/archives --store data/store --port 8080 --max-block-size 4MiB
 ```
 
-On startup it ingests every new archive: decomposes it, stores the blocks, records the hashes.
-Then:
+On startup it ingests every new archive in `--archives`. Then:
 
 ```bash
 curl http://localhost:8080/api/versions
 ```
+
+#### Publishing a release: what "ingest" means
+
+A release reaches clients in two steps: its archive file is put into the archive directory, and
+the server **ingests** it. Ingest is the one-off preparation that turns a file into a version
+clients can fetch:
+
+1. **Detect** the container format from the magic bytes. The version id is the file name without
+   its extension, so `archive-v02.zip` becomes `archive-v02`.
+2. **Decompose** the archive into its blueprint, cutting the decompressed content into blocks.
+3. **Store** the blocks. The store is shared by all versions and keyed by block hash, so only
+   blocks no earlier release contains take up new space. For a release that changes little,
+   that is a small fraction of its size.
+4. **Verify** by rebuilding the archive from blueprint and store and comparing the SHA-256
+   (`--verify`, see "Bit exact rebuilds").
+5. **Publish**: write the blueprint and add the version with its hashes to `index.json`. Only now
+   does it appear in `/api/versions`.
+
+If any step fails, the release is not published, and no client sees a half prepared version.
+The decomposition is done once per release; transfers later only read its result.
+
+Ingest runs on server startup (unless `--no-scan`) and on request over the admin port; there is
+no file watcher:
+
+```bash
+curl -X POST http://localhost:8081/api/rescan
+```
+
+Both scan the archive directory and ingest what is not indexed yet. A file counts as indexed
+when its version id is in the index with the same file size and its blueprint exists.
+
+- Copy a release in under a transient name (`.part`, `.tmp`, `.crdownload`, or a leading dot)
+  and rename it when complete. Otherwise a scan can pick up a half copied file.
+- Do not replace a published release in place. A file with a new size is ingested again under
+  the same id, which changes a version clients may already hold. A file with the *same* size is
+  not noticed at all. Publish a corrected release under a new name instead.
 
 ### 3. Fetch with the client
 
@@ -356,14 +405,14 @@ jdt client hash --file FILE          SHA-256 of a local file
 --avg-block-size SZ   target average block size                 (default: 64KiB)
 --threads N           HTTP worker threads                       (default: cores)
 --ingest-threads N    archives decomposed in parallel on scan   (default: cores/2, max 4)
---max-7z-size SZ      largest nested 7z opened up                (default: 512MiB)
---compress true|false compress the block stream                 (default: true)
---tls-keystore FILE   server certificate and key; turns on HTTPS on both ports
---tls-truststore FILE client certificates to accept (mutual TLS)
---tls-require-client-cert   refuse clients without a certificate|false compress the block stream                  (default: true)
---compress-level N    gzip level, 0 disables it                  (default: 1)
+--max-7z-size SZ      largest nested 7z opened up               (default: 512MiB)
 --compress true|false compress the block stream                 (default: true)
 --compress-level N    gzip level, 0 disables it                 (default: 1)
+--tls-keystore FILE   server certificate and key; turns on HTTPS on both ports
+--tls-keystore-password P     or JDT_TLS_KEYSTORE_PASSWORD
+--tls-truststore FILE client certificates to accept (mutual TLS)
+--tls-truststore-password P   or JDT_TLS_TRUSTSTORE_PASSWORD
+--tls-require-client-cert     refuse clients without a certificate
 --verify true|false   rebuild and compare after each ingest     (default: true)
 --force-reindex       discard blocks and blueprints, ingest again
 --no-scan             do not ingest on startup
@@ -372,21 +421,27 @@ jdt client hash --file FILE          SHA-256 of a local file
 ### Client
 
 ```
---server URL   server base URL                     (default: http://localhost:8080)
---cache DIR    where the decomposed base is cached (default: ./jdt-client-cache)
---keep-base-cache  copy the index to the new version instead of renaming it
---index-threads N  entries decomposed in parallel while indexing the base (default: min(cores, 8))
---rebuild-threads N  nested archives and deflated entries rebuilt in parallel (default: min(cores, 8))
---rebuild-as M       original (default), zip or extract; see "Giving up byte identity"
---no-compress        do not ask the server to compress the block stream
---truststore FILE    certificates this client accepts (for a private server certificate)
---client-cert FILE   this client's own certificate, for a server requiring one
-               One sub directory per base version, named by its hash. Nothing prunes it, so
-               delete the sub directories of versions you no longer upgrade from.
---version ID   version to fetch
---base FILE    older local version (omit for a full download)
---out FILE     destination
+--version ID            version to fetch
+--base FILE             older local version (omit for a full download)
+--out FILE              destination
+--server URL            server base URL                           (default: http://localhost:8080)
+--truststore FILE       certificates this client accepts (for a private server certificate)
+--truststore-password P      or JDT_TRUSTSTORE_PASSWORD
+--client-cert FILE      this client's own certificate, for a server requiring one
+--client-cert-password P     or JDT_CLIENT_CERT_PASSWORD
+--no-compress           do not ask the server to compress the block stream
+--cache DIR             where the decomposed base is cached       (default: ./jdt-client-cache)
+--keep-base-cache       copy the index to the new version instead of renaming it
+--index-threads N       entries decomposed in parallel while indexing the base (default: min(cores, 8))
+--rebuild-threads N     nested archives and deflated entries rebuilt in parallel (default: min(cores, 8))
+--rebuild-as M          original (default), zip or extract; see "Giving up byte identity"
 ```
+
+The cache holds one index per base file, in a sub directory named after the file's SHA-256 and
+the server's block parameters. After a delta fetch that sub directory is renamed to the new
+version, so upgrading one version at a time leaves exactly one behind. Nothing else prunes the
+cache: with `--keep-base-cache`, or after the server's block parameters change, delete the sub
+directories of bases you no longer upgrade from.
 
 ### Generator
 
