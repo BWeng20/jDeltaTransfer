@@ -534,6 +534,29 @@ first no longer pays for indexing at all.
 - ZIP archives with prepended data (self extracting stubs) whose central directory offset does not
   match the real position fall back to opaque blocks.
 - All of the above are correctness preserving fallbacks; they only reduce how small a delta gets.
+- Memory use of a ZIP grows with the number of its small entries, see below.
+
+### Memory use with large archives
+
+Large intermediate results go to temp files, so the size of an archive alone does not decide how
+much heap is needed. What does is its structure: when a ZIP is taken apart, its small entries
+are decompressed into memory, and all of them are held until the whole container has been read.
+Rebuilding such a ZIP in parallel likewise holds the recompressed entries until all are done.
+An archive with a great many small files in one ZIP — typical for a product with many libraries
+and resources — can therefore need far more heap than the archive's size suggests. This applies to
+the server while ingesting and to the client while indexing its base and rebuilding. If it runs
+out of memory, raise the heap through `JDT_OPTS`.
+
+CAB and 7z are not affected: they decompress into temp files and rebuild as a stream, so their
+memory use does not depend on how many files they hold. A 7z needs memory for its LZMA
+dictionary instead, per container being processed.
+
+How this could be fixed, without changing blocks, blueprints or the protocol:
+
+- **Taking apart:** write each small entry, once its compression level is probed, to a single
+  shared temp file instead of keeping it in memory, so the heap holds one entry per thread.
+- **Rebuilding:** recompress entries in a sliding window and write out finished ones in order,
+  instead of recompressing all of them before writing any.
 
 ### Raising the 7z limit
 
