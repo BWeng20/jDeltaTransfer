@@ -59,7 +59,11 @@ public final class VersionStore implements Closeable {
     private volatile int ingestThreads = 1;
     private volatile DecomposeLimits limits = DecomposeLimits.DEFAULT;
 
-    /** Everything the HTTP API publishes about one archive version. */
+    /**
+     * Everything the HTTP API publishes about one archive version, plus the file date the scan
+     * compares ({@code fileModified}, kept in the index only; null for entries from an index
+     * written before it was recorded).
+     */
     public record VersionInfo(
             String id,
             String fileName,
@@ -71,7 +75,13 @@ public final class VersionStore implements Closeable {
             long distinctBlocks,
             long containers,
             long opaqueContainers,
-            String ingestedAt) {
+            String ingestedAt,
+            String fileModified) {
+
+        VersionInfo withFileModified(String modified) {
+            return new VersionInfo(id, fileName, size, sha256, blueprintSha256, blueprintBytes,
+                    blockRefs, distinctBlocks, containers, opaqueContainers, ingestedAt, modified);
+        }
     }
 
     private VersionStore(Path storeDir, Path archiveDir, ChunkStore blocks,
@@ -217,15 +227,42 @@ public final class VersionStore implements Closeable {
             candidates.add(file);
         }
 
+        // A file is up to date when size and file date match the index. The size alone misses an
+        // archive replaced in place by one of the same size, which would keep serving the old
+        // blueprint and fail every client's hash check.
         List<Path> pending = new ArrayList<>();
+        boolean adopted = false;
         for (Path archive : candidates) {
             String id = idFor(archive);
             VersionInfo existing = version(id);
-            if (existing != null && existing.size() == Files.size(archive)
-                    && Files.exists(blueprintDir.resolve(id + ".bp"))) {
-                continue;
+            if (existing != null) {
+                boolean indexed = existing.size() == Files.size(archive)
+                        && Files.exists(blueprintDir.resolve(id + ".bp"));
+                String modified = fileModified(archive);
+                if (indexed && existing.fileModified() == null) {
+                    // Ingested before file dates were recorded. Trust it as before rather than
+                    // decomposing a whole store again, and compare the date from now on.
+                    synchronized (this) {
+                        versions.put(id, existing.withFileModified(modified));
+                    }
+                    adopted = true;
+                    continue;
+                }
+                if (indexed && modified.equals(existing.fileModified())) {
+                    continue;
+                }
+                log.info("ingesting " + archive.getFileName()
+                        + " again: its size, file date or blueprint no longer match the index");
             }
             pending.add(archive);
+        }
+        if (adopted) {
+            writeLock.lock();
+            try {
+                saveIndex();
+            } finally {
+                writeLock.unlock();
+            }
         }
         if (pending.isEmpty()) {
             return 0;
@@ -267,6 +304,9 @@ public final class VersionStore implements Closeable {
     public VersionInfo ingest(String id, Path archive, Log log) throws IOException {
         {
             long t0 = System.nanoTime();
+            // Taken before decomposing: a file changed while it is being read gets a newer date
+            // than the one recorded, so the next scan picks it up again.
+            String modified = fileModified(archive);
             ByteSource src = ByteSource.ofFile(archive);
 
             java.util.concurrent.atomic.AtomicLong containers = new java.util.concurrent.atomic.AtomicLong();
@@ -316,7 +356,8 @@ public final class VersionStore implements Closeable {
                     stats.distinctChunks(),
                     containers.get(),
                     opaque.get(),
-                    Instant.now().toString());
+                    Instant.now().toString(),
+                    modified);
 
             // Only the index update is serialised; decomposition above runs concurrently.
             writeLock.lock();
@@ -369,7 +410,8 @@ public final class VersionStore implements Closeable {
                         n.path("distinctBlocks").asLong(),
                         n.path("containers").asLong(),
                         n.path("opaqueContainers").asLong(),
-                        n.path("ingestedAt").asText());
+                        n.path("ingestedAt").asText(),
+                        n.hasNonNull("fileModified") ? n.get("fileModified").asText() : null);
                 versions.put(info.id(), info);
             }
         }
@@ -396,6 +438,9 @@ public final class VersionStore implements Closeable {
             n.put("containers", v.containers());
             n.put("opaqueContainers", v.opaqueContainers());
             n.put("ingestedAt", v.ingestedAt());
+            if (v.fileModified() != null) {
+                n.put("fileModified", v.fileModified());
+            }
         }
         atomicWrite(storeDir.resolve("index.json"), json.writeValueAsBytes(root));
     }
@@ -436,6 +481,10 @@ public final class VersionStore implements Closeable {
         String name = archive.getFileName().toString();
         int dot = name.lastIndexOf('.');
         return dot > 0 ? name.substring(0, dot) : name;
+    }
+
+    private static String fileModified(Path archive) throws IOException {
+        return Files.getLastModifiedTime(archive).toInstant().toString();
     }
 
     /** Skips half written files, so a scan cannot pick up an archive that is still being copied. */

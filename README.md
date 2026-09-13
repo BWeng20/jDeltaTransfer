@@ -354,13 +354,15 @@ curl -X POST http://localhost:8081/api/rescan
 ```
 
 Both scan the archive directory and ingest what is not indexed yet. A file counts as indexed
-when its version id is in the index with the same file size and its blueprint exists.
+when its version id is in the index with the same file size and file date, and its blueprint
+exists.
 
 - Copy a release in under a transient name (`.part`, `.tmp`, `.crdownload`, or a leading dot)
   and rename it when complete. Otherwise a scan can pick up a half copied file.
-- Do not replace a published release in place. A file with a new size is ingested again under
-  the same id, which changes a version clients may already hold. A file with the *same* size is
-  not noticed at all. Publish a corrected release under a new name instead.
+- Do not replace a published release in place. The next scan notices the new size or date and
+  ingests the file again under the same id, but clients may already hold the old content under
+  that id, and a delta from it would be built against the wrong base. Publish a corrected
+  release under a new name instead.
 
 ### 3. Fetch with the client
 

@@ -310,9 +310,15 @@ cannot leave it half updated. Schema: [store-index.schema.json](schema/store-ind
   "chunkMin" : 16384,
   "chunkAvg" : 65536,
   "chunkMax" : 262144,
-  "versions" : [ { "id" : "archive-v01", "...": "as in the API, minus sizeHuman and hashAlgorithm" } ]
+  "versions" : [ { "id" : "archive-v01", "...": "as in the API, minus sizeHuman and hashAlgorithm",
+                   "fileModified" : "2026-09-12T16:02:41.113Z" } ]
 }
 ```
+
+`fileModified` is the archive file's last modified date at ingest; it is not part of the API. A
+scan ingests a file again when its size or this date differ from the index, so an archive
+replaced by one of the same size is noticed. Entries from an older index lack the field; the next
+scan records the current date for them without ingesting again.
 
 `chunkMin` / `chunkAvg` / `chunkMax` are recorded because block boundaries depend on them.
 Starting the server with different values is refused rather than accepted, because mixing block

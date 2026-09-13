@@ -62,7 +62,12 @@
           "distinctBlocks": {"type": "integer", "minimum": 0},
           "containers": {"type": "integer", "minimum": 0},
           "opaqueContainers": {"type": "integer", "minimum": 0},
-          "ingestedAt": {"type": "string", "format": "date-time"}
+          "ingestedAt": {"type": "string", "format": "date-time"},
+          "fileModified": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Last modified date of the archive file when it was ingested. A scan ingests the file again when its size or this date differ. Absent in indexes written before it was recorded; the next scan fills it in without ingesting again."
+          }
         }
       }
     }

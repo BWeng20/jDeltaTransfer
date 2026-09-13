@@ -3,11 +3,14 @@ package com.bw.jdt;
 import com.bw.jdt.core.Chunker;
 import com.bw.jdt.server.VersionStore;
 import com.bw.jdt.tools.GenerateTestArchives;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.FileTime;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -136,5 +139,54 @@ class ArchiveDiscoveryTest {
             assertTrue(log.warnings.stream().anyMatch(w -> w.contains("already taken")),
                     "the operator must be told about the collision, got " + log.warnings);
         }
+    }
+
+    /**
+     * An archive replaced by one of the same size must not keep its old blueprint. The size
+     * cannot tell them apart, so the scan compares the file date as well.
+     */
+    @Test
+    void aNewerFileDateIsIngestedAgainEvenAtTheSameSize(@TempDir Path tmp) throws Exception {
+        Path archives = tmp.resolve("archives");
+        GenerateTestArchives.main(new String[]{
+                "--out", archives.toString(), "--count", "1", "--start-size", "8MB", "--threads", "1"});
+        Path archive = archives.resolve("archive-v01.zip");
+
+        RecordingLog log = new RecordingLog();
+        try (VersionStore store = open(tmp, archives)) {
+            assertEquals(1, store.scan(log));
+            assertEquals(0, store.scan(log), "an unchanged file must not be ingested again");
+
+            Files.setLastModifiedTime(archive,
+                    FileTime.from(Files.getLastModifiedTime(archive).toInstant().plusSeconds(3600)));
+            assertEquals(1, store.scan(log), "same size, newer date: must be ingested again");
+            assertEquals(Files.getLastModifiedTime(archive).toInstant().toString(),
+                    store.version("archive-v01").fileModified());
+        }
+    }
+
+    /** A store indexed before file dates were recorded must not be decomposed all over again. */
+    @Test
+    void anIndexWithoutFileDatesIsAdoptedWithoutReingesting(@TempDir Path tmp) throws Exception {
+        Path archives = tmp.resolve("archives");
+        GenerateTestArchives.main(new String[]{
+                "--out", archives.toString(), "--count", "1", "--start-size", "8MB", "--threads", "1"});
+        Path indexFile = tmp.resolve("store").resolve("index.json");
+
+        RecordingLog log = new RecordingLog();
+        try (VersionStore store = open(tmp, archives)) {
+            assertEquals(1, store.scan(log));
+        }
+        ObjectMapper json = new ObjectMapper();
+        ObjectNode root = (ObjectNode) json.readTree(indexFile.toFile());
+        root.withArray("versions").forEach(v -> ((ObjectNode) v).remove("fileModified"));
+        json.writeValue(indexFile.toFile(), root);
+
+        try (VersionStore store = open(tmp, archives)) {
+            assertEquals(0, store.scan(log), "an old index entry must be trusted, not re-ingested");
+            assertNotNull(store.version("archive-v01").fileModified());
+        }
+        assertTrue(json.readTree(indexFile.toFile()).path("versions").get(0).hasNonNull("fileModified"),
+                "the adopted date must be written to index.json");
     }
 }
